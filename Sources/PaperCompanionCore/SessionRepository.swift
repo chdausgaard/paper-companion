@@ -29,6 +29,28 @@ public struct SessionPaths: Equatable, Sendable {
     public var paperMarkdown: URL { cache.appendingPathComponent("paper.md") }
 }
 
+/// Local reference material the generated agent protocol points to.
+///
+/// Resolved from the current user's home directory rather than hardcoded, and
+/// omitted from the protocol when the directory is absent — otherwise a build
+/// running on someone else's Mac sends their agent to paths that do not exist.
+public enum UserReferences {
+    public static func resolve(_ relativePath: String, fileManager: FileManager = .default) -> String? {
+        let url = fileManager.homeDirectoryForCurrentUser.appendingPathComponent(relativePath)
+        return fileManager.fileExists(atPath: url.path) ? url.path : nil
+    }
+
+    /// Deep PDF extraction protocol.
+    public static var pdfToolkit: String? {
+        resolve(".claude/research-standards/pdf-toolkit.md")
+    }
+
+    /// Causal-inference reference consulted before identification comments.
+    public static var causalInference: String? {
+        resolve("docs/causal-inference")
+    }
+}
+
 public enum SessionRepositoryError: Error, LocalizedError {
     case missingManifest
     case unsupportedSchema(Int)
@@ -119,7 +141,8 @@ public struct SessionRepository {
         pageCount: Int,
         extractedText: String,
         sessionsRoot: URL? = nil,
-        pdfToolkitPath: String? = "/Users/christoffer/.claude/research-standards/pdf-toolkit.md"
+        pdfToolkitPath: String? = UserReferences.pdfToolkit,
+        causalInferencePath: String? = UserReferences.causalInference
     ) throws -> LoadedSession {
         let fingerprint = try fingerprint(of: pdfURL)
         let root = try sessionsRoot ?? defaultSessionsRoot()
@@ -149,7 +172,10 @@ public struct SessionRepository {
         try writeText(extractedText, to: paths.documentText)
         try writeText(initialSharedUnderstanding(title: title), to: paths.sharedUnderstanding)
         try writeText("# Agent transcript\n\n", to: paths.transcript)
-        try writeText(agentInstructions(toolkitPath: pdfToolkitPath), to: paths.agentInstructions)
+        try writeText(
+            agentInstructions(toolkitPath: pdfToolkitPath, causalInferencePath: causalInferencePath),
+            to: paths.agentInstructions
+        )
         try writeText(MarkdownExporter.renderComments(title: title, highlights: [], comments: []), to: paths.commentsMarkdown)
         try appendEvent(
             SessionEvent(sessionID: manifest.id, actor: "app", origin: "open_pdf", kind: "session_created"),
@@ -183,7 +209,15 @@ public struct SessionRepository {
         // reopening a paper picks up protocol changes made since it was created.
         // Directories are re-created for the same reason — older sessions predate some.
         try createDirectories(paths)
-        try writeText(agentInstructions(toolkitPath: manifest.pdfToolkitPath), to: paths.agentInstructions)
+        // A session carried to another Mac keeps the path recorded when it was
+        // created; prefer it only while it still resolves there.
+        let toolkit = manifest.pdfToolkitPath.flatMap {
+            fileManager.fileExists(atPath: $0) ? $0 : nil
+        } ?? UserReferences.pdfToolkit
+        try writeText(
+            agentInstructions(toolkitPath: toolkit, causalInferencePath: UserReferences.causalInference),
+            to: paths.agentInstructions
+        )
 
         return LoadedSession(
             manifest: manifest,
@@ -329,7 +363,29 @@ public struct SessionRepository {
         """
     }
 
-    private func agentInstructions(toolkitPath: String?) -> String {
+    /// Named routing when the reference is on this machine; the discipline
+    /// without the routing when it is not.
+    private func methodsReferenceSection(causalInferencePath: String?) -> String {
+        guard let reference = causalInferencePath else {
+            return """
+            ## Methods reference
+
+            Workshop papers here are overwhelmingly identification papers, and the user's comments are overwhelmingly identification comments. Do not answer identification questions from memory. Name the estimator, state the identifying assumption the comment turns on, and check it against what the paper actually reports before drafting. If a local methods reference is configured on this machine, route through it first.
+            """
+        }
+        return """
+        ## Methods reference
+
+        The user keeps a causal-inference reference at `\(reference)/`. Papers at this workshop are overwhelmingly identification papers, and his comments are overwhelmingly identification comments. Consult it rather than answering from memory.
+
+        - **At session start**, once the design is known from the pre-read, route through `index.md` (its table maps data structure and assignment mechanism to a method) and load the one or two `overview.md` files matching the paper's design. Read `usage-guide.md` first; when you enter a method directory read its `_nav.md` before any other file in it. Do not read the whole directory.
+        - **While reading**, consult it whenever a comment turns on an identifying assumption — parallel trends, staggered adoption, exclusion restrictions, bad controls, colliders, forbidden regressions, what a two-way fixed-effects estimator actually averages. Delegate the lookup to a sub-agent when it needs more than a file or two; the answer, not the source text, belongs in the main context.
+        - **Before drafting**, check each identification comment against the relevant file. This cuts both ways and both directions are useful: it kills comments where the paper's design is already known to handle the objection, and it upgrades vague unease into the named diagnostic and the standard fix the authors will recognise.
+        - Cite what you used — `[methods/diff-in-diff/staggered-treatment.md]` — so he can check it. The reference is a synthesis of Huntington-Klein and Cunningham, not a citation for the room: name the underlying estimator or paper when he needs something to say aloud.
+        """
+    }
+
+    func agentInstructions(toolkitPath: String?, causalInferencePath: String?) -> String {
         let toolkit = toolkitPath ?? "the user's configured PDF toolkit"
         return """
         # Paper Companion reading-session protocol
@@ -343,14 +399,7 @@ public struct SessionRepository {
         3. Read `agent/shared-understanding.md` only when cumulative context is needed. Read its Reference detail section only when you need a specification or a number.
         4. Use the PDF extraction protocol at `\(toolkit)` for substantive PDF reading. Do not treat `document-text.txt` as authoritative for complex layouts, tables, figures, or scans.
 
-        ## Methods reference
-
-        The user keeps a causal-inference reference at `/Users/christoffer/docs/causal-inference/`. Papers at this workshop are overwhelmingly identification papers, and his comments are overwhelmingly identification comments. Consult it rather than answering from memory.
-
-        - **At session start**, once the design is known from the pre-read, route through `index.md` (its table maps data structure and assignment mechanism to a method) and load the one or two `overview.md` files matching the paper's design. Read `usage-guide.md` first; when you enter a method directory read its `_nav.md` before any other file in it. Do not read the whole directory.
-        - **While reading**, consult it whenever a comment turns on an identifying assumption — parallel trends, staggered adoption, exclusion restrictions, bad controls, colliders, forbidden regressions, what a two-way fixed-effects estimator actually averages. Delegate the lookup to a sub-agent when it needs more than a file or two; the answer, not the source text, belongs in the main context.
-        - **Before drafting**, check each identification comment against the relevant file. This cuts both ways and both directions are useful: it kills comments where the paper's design is already known to handle the objection, and it upgrades vague unease into the named diagnostic and the standard fix the authors will recognise.
-        - Cite what you used — `[methods/diff-in-diff/staggered-treatment.md]` — so he can check it. The reference is a synthesis of Huntington-Klein and Cunningham, not a citation for the room: name the underlying estimator or paper when he needs something to say aloud.
+        \(methodsReferenceSection(causalInferencePath: causalInferencePath))
 
         ## Ownership
 

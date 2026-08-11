@@ -45,7 +45,12 @@ Important files:
 
 `AGENTS.md` is app-owned and rewritten from the template in `Sources/PaperCompanionCore/SessionRepository.swift` every time a session is opened, so protocol changes reach papers you have already started. Edit the template, not the copy inside a session.
 
-It references two of the user's own references: `/Users/christoffer/.claude/research-standards/pdf-toolkit.md`, the authoritative path for deep PDF extraction, and `/Users/christoffer/docs/causal-inference/`, which the agent is told to route through before any comment that turns on an identifying assumption. `document-text.txt` is a convenient PDFKit extraction and can have incorrect reading order for columns, tables, or figures.
+The protocol points the agent at two local references, both resolved from the current user's home directory at session load and both optional:
+
+- `~/.claude/research-standards/pdf-toolkit.md` — the authoritative path for deep PDF extraction.
+- `~/docs/causal-inference/` — routed through before any comment that turns on an identifying assumption.
+
+When a directory is missing, that section degrades to the discipline without the routing rather than naming a path that does not exist on this machine. Nothing is hardcoded to one user's home. `document-text.txt` is a convenient PDFKit extraction and can have incorrect reading order for columns, tables, or figures.
 
 ## Build and test
 

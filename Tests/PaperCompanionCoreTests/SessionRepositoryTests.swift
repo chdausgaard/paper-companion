@@ -164,10 +164,33 @@ final class SessionRepositoryTests: XCTestCase {
         XCTAssertFalse(instructions.contains("# Old protocol"))
         XCTAssertTrue(instructions.contains("Paper Companion reading-session protocol"))
         XCTAssertTrue(instructions.contains("cache/paper.md"))
-        XCTAssertTrue(instructions.contains("/Users/christoffer/docs/causal-inference/"))
+        XCTAssertTrue(instructions.contains("## Methods reference"))
         var isDirectory: ObjCBool = false
         XCTAssertTrue(FileManager.default.fileExists(atPath: reloaded.paths.cache.path, isDirectory: &isDirectory))
         XCTAssertTrue(isDirectory.boolValue)
+    }
+
+    func testProtocolNamesLocalReferencesOnlyWhenTheyResolve() throws {
+        let present = repository.agentInstructions(
+            toolkitPath: "/somewhere/pdf-toolkit.md",
+            causalInferencePath: "/somewhere/causal-inference"
+        )
+        XCTAssertTrue(present.contains("`/somewhere/pdf-toolkit.md`"))
+        XCTAssertTrue(present.contains("`/somewhere/causal-inference/`"))
+        XCTAssertTrue(present.contains("route through `index.md`"))
+
+        // On a machine without those directories the protocol must not send an
+        // agent to a path that does not exist, but must keep the discipline.
+        let absent = repository.agentInstructions(toolkitPath: nil, causalInferencePath: nil)
+        XCTAssertFalse(absent.contains("/somewhere/"))
+        XCTAssertFalse(absent.contains("/Users/christoffer"))
+        XCTAssertTrue(absent.contains("## Methods reference"))
+        XCTAssertTrue(absent.contains("Do not answer identification questions from memory"))
+        XCTAssertTrue(absent.contains("the user's configured PDF toolkit"))
+    }
+
+    func testUserReferencesReturnNilForMissingDirectories() {
+        XCTAssertNil(UserReferences.resolve("this/does/not/exist-\(UUID().uuidString)"))
     }
 
     func testMalformedManifestIsReportedWithoutOverwrite() throws {
