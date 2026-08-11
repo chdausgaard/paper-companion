@@ -6,18 +6,26 @@ struct ContentView: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Group {
-            if state.document == nil {
-                WelcomeView()
-            } else {
-                HSplitView {
-                    PDFReaderView(state: state)
-                        .frame(minWidth: 560, minHeight: 620)
+        // The status bar is a row of the window, not a safe-area inset: as an
+        // inset it floated over the PDF and clipped the last line of the page.
+        VStack(spacing: 0) {
+            Group {
+                if state.document == nil {
+                    WelcomeView()
+                } else {
+                    HSplitView {
+                        PDFReaderView(state: state)
+                            .frame(minWidth: 560, minHeight: 560)
 
-                    InspectorView()
-                        .frame(minWidth: 340, idealWidth: 390, maxWidth: 500)
+                        InspectorView()
+                            .frame(minWidth: 340, idealWidth: 390, maxWidth: 500)
+                    }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+            Divider()
+            StatusBar()
         }
         .frame(minWidth: 980, minHeight: 680)
         .toolbar {
@@ -81,9 +89,6 @@ struct ContentView: View {
                 .help("Reveal this paper’s notes, comments, highlights, and agent files in Finder")
             }
         }
-        .safeAreaInset(edge: .bottom) {
-            StatusBar()
-        }
         .alert("Paper Companion", isPresented: Binding(
             get: { state.errorMessage != nil },
             set: { if !$0 { state.errorMessage = nil } }
@@ -140,7 +145,8 @@ private struct StatusBar: View {
         }
         .font(.caption)
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .padding(.vertical, 5)
+        .frame(height: 24)
         .background(.bar)
     }
 }
@@ -170,12 +176,11 @@ struct InspectorView: View {
 
 struct NotesView: View {
     @EnvironmentObject private var state: AppState
-    @State private var showSavedComments = true
 
     private var linkedButtonTitle: String {
-        if state.selectedHighlight != nil { return "Save linked to highlight" }
-        if state.currentSelection != nil { return "Highlight selection + save" }
-        return "Save linked comment"
+        if state.selectedHighlight != nil { return "Save linked" }
+        if state.currentSelection != nil { return "Highlight + save" }
+        return "Save linked"
     }
 
     private var commentExplanation: String {
@@ -192,7 +197,20 @@ struct NotesView: View {
         state.activeComments.sorted { $0.createdAt > $1.createdAt }
     }
 
+    // Three panes with draggable dividers, so a long comment or a long note can
+    // take the space it needs without the other sections being pinned open.
     var body: some View {
+        VSplitView {
+            composer
+                .frame(minHeight: 240, idealHeight: 300)
+            savedComments
+                .frame(minHeight: 90, idealHeight: 190)
+            documentNotes
+                .frame(minHeight: 90, idealHeight: 170)
+        }
+    }
+
+    private var composer: some View {
         VStack(alignment: .leading, spacing: 10) {
             GroupBox("Active context") {
                 VStack(alignment: .leading, spacing: 6) {
@@ -225,7 +243,7 @@ struct NotesView: View {
                 .font(.headline)
             TextEditor(text: $state.commentDraft)
                 .font(.body)
-                .frame(minHeight: 82, maxHeight: 130)
+                .frame(minHeight: 60)
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
 
             Text(commentExplanation)
@@ -246,35 +264,49 @@ struct NotesView: View {
                 .help("Save a comment linked to highlighted text; a current selection becomes a new highlight")
             }
 
-            Divider()
-            DisclosureGroup(
-                "Saved comments (\(state.activeComments.count))",
-                isExpanded: $showSavedComments
-            ) {
-                if sortedComments.isEmpty {
-                    Text("No saved comments yet. A saved comment will remain visible here.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .padding(.vertical, 6)
-                } else {
-                    ScrollView {
-                        LazyVStack(alignment: .leading, spacing: 8) {
-                            ForEach(sortedComments) { comment in
-                                SavedCommentRow(comment: comment)
-                                if comment.id != sortedComments.last?.id { Divider() }
-                            }
-                        }
-                    }
-                    .frame(maxHeight: 155)
+            HStack(spacing: 6) {
+                Button {
+                    state.addQuickNote()
+                } label: {
+                    Label("Margin note", systemImage: "pencil.line")
                 }
-                Text("Stored in `comments.md` and `state/comments.json` inside this paper’s session folder.")
+                .help("Save as a margin note (⇧⌘M): recorded and anchored, but the agent will not respond to it")
+
+                Text("recorded, no agent response")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .padding(.top, 4)
             }
+        }
+        .padding(12)
+    }
 
-            Divider()
+    private var savedComments: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Saved comments (\(state.activeComments.count))")
+                .font(.headline)
+
+            if sortedComments.isEmpty {
+                Text("No saved comments yet. A saved comment will remain visible here.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 8) {
+                        ForEach(sortedComments) { comment in
+                            SavedCommentRow(comment: comment)
+                            if comment.id != sortedComments.last?.id { Divider() }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .padding(12)
+    }
+
+    private var documentNotes: some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text("Document notes (not anchored)")
                     .font(.headline)
@@ -282,12 +314,9 @@ struct NotesView: View {
                 Button("Save", action: state.saveNotes)
                     .help("Save the document-level notes now; they also autosave as you type")
             }
-            Text("A free-form Markdown scratchpad for the paper as a whole. It is not linked to a page, selection, or highlight and is stored in `notes.md`.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
             TextEditor(text: $state.notes)
                 .font(.system(.body, design: .monospaced))
-                .frame(minHeight: 100)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .overlay(RoundedRectangle(cornerRadius: 6).stroke(.quaternary))
                 .onChange(of: state.notes) { _ in
                     state.scheduleNotesSave()
@@ -306,6 +335,11 @@ private struct SavedCommentRow: View {
         return state.highlights.first { $0.id == highlightID }
     }
 
+    private var descriptor: String {
+        if comment.kind == .quiet { return "Margin note" }
+        return comment.highlightID == nil ? "Page-only" : "Linked to highlight"
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             Button {
@@ -313,10 +347,10 @@ private struct SavedCommentRow: View {
             } label: {
                 VStack(alignment: .leading, spacing: 4) {
                     Label(
-                        comment.highlightID == nil
-                            ? "Page-only · page \(comment.pageLabel ?? "?")"
-                            : "Linked to highlight · page \(comment.pageLabel ?? "?")",
-                        systemImage: comment.highlightID == nil ? "doc.text" : "highlighter"
+                        "\(descriptor) · page \(comment.pageLabel ?? "?")",
+                        systemImage: comment.kind == .quiet
+                            ? "pencil.line"
+                            : (comment.highlightID == nil ? "doc.text" : "highlighter")
                     )
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
@@ -471,7 +505,7 @@ private struct AgentContextView: View {
                 .frame(maxHeight: 210)
             }
 
-            DisclosureGroup("Shared understanding") {
+            DisclosureGroup("Agent understanding") {
                 ScrollView {
                     Text(state.sharedUnderstandingPreview)
                         .font(.caption.monospaced())

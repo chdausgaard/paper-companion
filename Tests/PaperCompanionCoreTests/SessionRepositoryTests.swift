@@ -109,6 +109,67 @@ final class SessionRepositoryTests: XCTestCase {
         XCTAssertEqual(second.comments, [comment])
     }
 
+    func testCommentsWrittenBeforeKindExistedLoadAsDiscuss() throws {
+        let pdfURL = temporaryDirectory.appendingPathComponent("legacy.pdf")
+        try Data("legacy source".utf8).write(to: pdfURL)
+        let loaded = try repository.createOrLoadSession(
+            pdfURL: pdfURL,
+            title: "Legacy",
+            pageCount: 1,
+            extractedText: "page text",
+            sessionsRoot: temporaryDirectory.appendingPathComponent("Sessions")
+        )
+
+        // A comments.json exactly as an earlier build wrote it: no `kind` key.
+        let legacy = """
+        [
+          {
+            "captureMethod" : "typed",
+            "createdAt" : "1970-01-01T00:01:40Z",
+            "id" : "5F1F4B02-6D3F-4D0E-9E3B-2A0A6F6E7A11",
+            "pageIndex" : 3,
+            "pageLabel" : "4",
+            "status" : "captured",
+            "tags" : [],
+            "updatedAt" : "1970-01-01T00:01:40Z",
+            "verbatim" : "An older comment"
+          }
+        ]
+        """
+        try repository.writeText(legacy, to: loaded.paths.comments)
+
+        let reloaded = try repository.loadSession(at: loaded.paths.root)
+        XCTAssertEqual(reloaded.comments.count, 1)
+        XCTAssertEqual(reloaded.comments.first?.kind, .discuss)
+        XCTAssertEqual(reloaded.comments.first?.verbatim, "An older comment")
+    }
+
+    func testLoadingRefreshesAgentInstructionsAndSessionDirectories() throws {
+        let pdfURL = temporaryDirectory.appendingPathComponent("protocol.pdf")
+        try Data("protocol source".utf8).write(to: pdfURL)
+        let loaded = try repository.createOrLoadSession(
+            pdfURL: pdfURL,
+            title: "Protocol",
+            pageCount: 1,
+            extractedText: "page text",
+            sessionsRoot: temporaryDirectory.appendingPathComponent("Sessions")
+        )
+
+        // Simulate a session created by an older build: stale protocol, no cache.
+        try repository.writeText("# Old protocol\n", to: loaded.paths.agentInstructions)
+        try FileManager.default.removeItem(at: loaded.paths.cache)
+
+        let reloaded = try repository.loadSession(at: loaded.paths.root)
+        let instructions = try String(contentsOf: reloaded.paths.agentInstructions, encoding: .utf8)
+        XCTAssertFalse(instructions.contains("# Old protocol"))
+        XCTAssertTrue(instructions.contains("Paper Companion reading-session protocol"))
+        XCTAssertTrue(instructions.contains("cache/paper.md"))
+        XCTAssertTrue(instructions.contains("/Users/christoffer/docs/causal-inference/"))
+        var isDirectory: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: reloaded.paths.cache.path, isDirectory: &isDirectory))
+        XCTAssertTrue(isDirectory.boolValue)
+    }
+
     func testMalformedManifestIsReportedWithoutOverwrite() throws {
         let root = temporaryDirectory.appendingPathComponent("Broken.reading")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

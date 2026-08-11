@@ -14,10 +14,11 @@ The packaged prototype is ad-hoc signed for local use. It is not Developer ID si
 
 1. Open a PDF with **⌘O**.
 2. Select text and press **⇧⌘H**, or enable **Auto-highlight selections** for drag-to-highlight reading. Remove a highlight from the Highlights tab; **⌘Z** restores the latest highlight change.
-3. In Notes, choose **Highlight selection + save** for a quote-linked comment, or **Save page-only** for a comment anchored only to the current page. Saved comments remain visible in the app.
-4. Keep document-level, unanchored Markdown notes in the Notes tab or detachable Notes window.
-5. Copy the agent prompt to discuss the current page, selection, highlights, and comments in your existing agent client.
-6. Use the Highlights tab to return to passages and export readable Markdown.
+3. In Notes, choose **Highlight + save** for a quote-linked comment, or **Save page-only** for a comment anchored only to the current page. Saved comments remain visible in the app.
+4. Press **⇧⌘M** for a **margin note** — anchored and recorded like any comment, but journalled so the agent files it without responding. This is for the reactions that are not worth a conversation: *nice explanation*, *this table is unreadable*, *lost the thread here*. They are read back at synthesis time, where a cluster of them on one section is itself a finding.
+5. Keep document-level, unanchored Markdown notes in the Notes tab or detachable Notes window. The three Notes sections have draggable dividers.
+6. Copy the agent prompt to discuss the current page, selection, highlights, and comments in your existing agent client.
+7. Use the Highlights tab to return to passages. Clicking a highlight scrolls to the passage itself and tints it, rather than stopping at the top of its page.
 
 The original PDF is never written or modified. Highlight rendering comes from sidecar records.
 
@@ -39,9 +40,12 @@ Important files:
 - `AGENTS.md`: instructions for an external filesystem-capable agent.
 - `agent/transcript.md`: agent-owned verbatim comment transcript.
 - `agent/shared-understanding.md`: agent-owned evolving interpretation.
-- `agent/excursions/`: scoped research side trips.
+- `agent/excursions/`: scoped research side trips, including the workshop synthesis.
+- `cache/`: agent-owned derived copies of the paper — `pdf2md` output as `cache/paper.md`, rendered figure pages. Keeps conversions out of the folder holding the original PDF.
 
-The generated `AGENTS.md` references `/Users/christoffer/.claude/research-standards/pdf-toolkit.md`. That toolkit remains the authoritative path for deep PDF extraction. `document-text.txt` is a convenient PDFKit extraction and can have incorrect reading order for columns, tables, or figures.
+`AGENTS.md` is app-owned and rewritten from the template in `Sources/PaperCompanionCore/SessionRepository.swift` every time a session is opened, so protocol changes reach papers you have already started. Edit the template, not the copy inside a session.
+
+It references two of the user's own references: `/Users/christoffer/.claude/research-standards/pdf-toolkit.md`, the authoritative path for deep PDF extraction, and `/Users/christoffer/docs/causal-inference/`, which the agent is told to route through before any comment that turns on an identifying assumption. `document-text.txt` is a convenient PDFKit extraction and can have incorrect reading order for columns, tables, or figures.
 
 ## Build and test
 

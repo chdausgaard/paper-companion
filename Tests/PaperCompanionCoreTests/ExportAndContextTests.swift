@@ -3,6 +3,44 @@ import XCTest
 @testable import PaperCompanionCore
 
 final class ExportAndContextTests: XCTestCase {
+    func testMarginNotesAreLabelledDistinctlyFromComments() {
+        let timestamp = Date(timeIntervalSince1970: 100)
+        let highlightID = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!
+        let highlight = HighlightRecord(
+            id: highlightID,
+            quote: "An elegant derivation.",
+            prefix: "",
+            suffix: "",
+            locations: [HighlightLocation(pageIndex: 2, pageLabel: "3", lineRects: [], textRanges: [])],
+            createdAt: timestamp
+        )
+        let quiet = CommentRecord(
+            highlightID: highlightID,
+            pageIndex: 2,
+            pageLabel: "3",
+            verbatim: "nice explanation",
+            kind: .quiet,
+            createdAt: timestamp
+        )
+        let discuss = CommentRecord(
+            pageIndex: 4,
+            pageLabel: "5",
+            verbatim: "The estimand is unclear here.",
+            createdAt: timestamp.addingTimeInterval(1)
+        )
+
+        let markdown = MarkdownExporter.renderComments(
+            title: "A Paper",
+            highlights: [highlight],
+            comments: [quiet, discuss]
+        )
+
+        XCTAssertTrue(markdown.contains("### Margin note `\(quiet.id.uuidString)`"))
+        XCTAssertTrue(markdown.contains("nice explanation"))
+        XCTAssertTrue(markdown.contains("### Comment `\(discuss.id.uuidString)`"))
+        XCTAssertFalse(markdown.contains("### Comment `\(quiet.id.uuidString)`"))
+    }
+
     func testMarkdownKeepsStableAnchorsAndSeparatesStandaloneComments() {
         let timestamp = Date(timeIntervalSince1970: 100)
         let highlightID = UUID(uuidString: "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE")!

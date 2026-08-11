@@ -55,6 +55,64 @@ final class AppStateWorkflowTests: XCTestCase {
     }
 
     @MainActor
+    func testMarginNoteAnchorsToSelectionAndIsMarkedQuiet() {
+        let state = AppState()
+        state.currentPageIndex = 4
+        state.currentPageLabel = "5"
+        state.currentSelection = selection()
+        state.commentDraft = "nice explanation"
+
+        state.addQuickNote()
+
+        XCTAssertEqual(state.comments.count, 1)
+        XCTAssertEqual(state.comments[0].kind, .quiet)
+        XCTAssertEqual(state.comments[0].highlightID, state.activeHighlights.first?.id)
+        XCTAssertEqual(state.comments[0].pageLabel, "5")
+        XCTAssertTrue(state.commentDraft.isEmpty)
+    }
+
+    @MainActor
+    func testMarginNoteFallsBackToPageWhenNothingIsSelected() {
+        let state = AppState()
+        state.currentPageIndex = 1
+        state.currentPageLabel = "2"
+        state.commentDraft = "this table is unreadable"
+
+        state.addQuickNote()
+
+        XCTAssertEqual(state.comments.count, 1)
+        XCTAssertEqual(state.comments[0].kind, .quiet)
+        XCTAssertNil(state.comments[0].highlightID)
+        XCTAssertEqual(state.comments[0].pageLabel, "2")
+        XCTAssertTrue(state.activeHighlights.isEmpty)
+    }
+
+    @MainActor
+    func testOrdinaryCommentsRemainDiscussKind() {
+        let state = AppState()
+        state.currentPageLabel = "5"
+        state.commentDraft = "The estimand is unclear."
+
+        state.addComment(linkToHighlight: false)
+
+        XCTAssertEqual(state.comments[0].kind, .discuss)
+    }
+
+    @MainActor
+    func testSelectingHighlightTargetsItForNavigation() {
+        let state = AppState()
+        state.currentSelection = selection()
+        state.addHighlight()
+        let highlight = state.activeHighlights[0]
+        state.navigationHighlightID = nil
+
+        state.selectHighlight(highlight)
+
+        XCTAssertEqual(state.navigationHighlightID, highlight.id)
+        XCTAssertEqual(state.navigationPageIndex, highlight.pageIndex)
+    }
+
+    @MainActor
     func testHighlightCreationCanBeUndoneAndRedone() {
         let state = AppState()
         let undoManager = UndoManager()

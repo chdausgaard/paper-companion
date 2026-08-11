@@ -27,10 +27,17 @@ struct PDFReaderView: NSViewRepresentable {
             pdfView.document = state.document
             context.coordinator.resetForDocument()
         }
-        context.coordinator.renderHighlights(state.activeHighlights, in: pdfView)
+        context.coordinator.renderHighlights(
+            state.activeHighlights,
+            selectedID: state.selectedHighlightID,
+            in: pdfView
+        )
         context.coordinator.navigateIfNeeded(
             requestID: state.navigationRequestID,
             pageIndex: state.navigationPageIndex,
+            highlight: state.navigationHighlightID.flatMap { id in
+                state.activeHighlights.first { $0.id == id }
+            },
             in: pdfView
         )
         context.coordinator.searchIfNeeded(
@@ -83,10 +90,14 @@ struct PDFReaderView: NSViewRepresentable {
             lastSearchQuery = ""
         }
 
-        func renderHighlights(_ highlights: [HighlightRecord], in pdfView: PDFView) {
+        func renderHighlights(
+            _ highlights: [HighlightRecord],
+            selectedID: UUID?,
+            in pdfView: PDFView
+        ) {
             let signature = highlights
                 .map { $0.id.uuidString + ($0.deletedAt == nil ? ":active" : ":deleted") }
-                .joined(separator: "|")
+                .joined(separator: "|") + "#\(selectedID?.uuidString ?? "none")"
             guard signature != renderedHighlightSignature else { return }
 
             if let document = pdfView.document {
@@ -103,7 +114,9 @@ struct PDFReaderView: NSViewRepresentable {
                         for rect in location.lineRects {
                             let bounds = NSRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
                             let annotation = PDFAnnotation(bounds: bounds, forType: .highlight, withProperties: nil)
-                            annotation.color = NSColor.systemYellow.withAlphaComponent(0.42)
+                            annotation.color = highlight.id == selectedID
+                                ? NSColor.systemOrange.withAlphaComponent(0.62)
+                                : NSColor.systemYellow.withAlphaComponent(0.42)
                             annotation.userName = "PaperCompanion:\(highlight.id.uuidString)"
                             page.addAnnotation(annotation)
                         }
@@ -113,12 +126,61 @@ struct PDFReaderView: NSViewRepresentable {
             renderedHighlightSignature = signature
         }
 
-        func navigateIfNeeded(requestID: UUID, pageIndex: Int?, in pdfView: PDFView) {
+        func navigateIfNeeded(
+            requestID: UUID,
+            pageIndex: Int?,
+            highlight: HighlightRecord?,
+            in pdfView: PDFView
+        ) {
             guard lastNavigationRequestID != requestID,
                   let pageIndex,
                   let page = pdfView.document?.page(at: pageIndex) else { return }
             lastNavigationRequestID = requestID
-            pdfView.go(to: page)
+
+            // Scrolling to the page alone leaves the reader hunting for the passage.
+            // Aim at the highlight itself, with margin so it lands inside the view
+            // rather than flush against its top edge.
+            guard let highlight,
+                  let destination = enclosingRect(for: highlight, pageIndex: pageIndex) else {
+                pdfView.go(to: page)
+                return
+            }
+            let margin = max(destination.height, 24) * 3
+            let padded = destination.insetBy(dx: 0, dy: -margin).intersection(page.bounds(for: pdfView.displayBox))
+            pdfView.go(to: padded.isNull ? destination : padded, on: page)
+            flash(highlight: highlight, pageIndex: pageIndex, in: pdfView)
+        }
+
+        /// Union of the highlight's line rectangles on the page being navigated to.
+        private func enclosingRect(for highlight: HighlightRecord, pageIndex: Int) -> NSRect? {
+            let rects = highlight.locations
+                .filter { $0.pageIndex == pageIndex }
+                .flatMap(\.lineRects)
+                .map { NSRect(x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
+            guard let first = rects.first else { return nil }
+            return rects.dropFirst().reduce(first) { $0.union($1) }
+        }
+
+        /// Briefly overlay the highlight so the eye catches it on arrival. The
+        /// overlay is removed again; the persistent annotation underneath is
+        /// what keeps the highlight visible.
+        private func flash(highlight: HighlightRecord, pageIndex: Int, in pdfView: PDFView) {
+            guard let page = pdfView.document?.page(at: pageIndex) else { return }
+            let overlays: [PDFAnnotation] = highlight.locations
+                .filter { $0.pageIndex == pageIndex }
+                .flatMap(\.lineRects)
+                .map { rect in
+                    let bounds = NSRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
+                    let annotation = PDFAnnotation(bounds: bounds, forType: .highlight, withProperties: nil)
+                    annotation.color = NSColor.systemOrange.withAlphaComponent(0.85)
+                    annotation.userName = "PaperCompanionFlash"
+                    page.addAnnotation(annotation)
+                    return annotation
+                }
+            guard !overlays.isEmpty else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
+                for overlay in overlays { page.removeAnnotation(overlay) }
+            }
         }
 
         func searchIfNeeded(requestID: UUID, query: String, in pdfView: PDFView) {

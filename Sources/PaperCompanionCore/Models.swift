@@ -118,11 +118,23 @@ public struct CommentRecord: Codable, Equatable, Identifiable, Sendable {
         case imported
     }
 
+    /// How much attention a comment asks of the agent.
+    ///
+    /// `discuss` is the normal case: the agent tests the point and responds.
+    /// `quiet` is a margin note — recorded verbatim, folded into the synthesis
+    /// if it turns out to matter, but never answered in the moment. It exists so
+    /// that small reactions ("nice explanation") cost nothing to write down.
+    public enum Kind: String, Codable, Sendable {
+        case discuss
+        case quiet
+    }
+
     public var id: UUID
     public var highlightID: UUID?
     public var pageIndex: Int?
     public var pageLabel: String?
     public var verbatim: String
+    public var kind: Kind
     public var captureMethod: CaptureMethod
     public var tags: [String]
     public var status: String
@@ -135,6 +147,7 @@ public struct CommentRecord: Codable, Equatable, Identifiable, Sendable {
         pageIndex: Int? = nil,
         pageLabel: String? = nil,
         verbatim: String,
+        kind: Kind = .discuss,
         captureMethod: CaptureMethod = .typed,
         tags: [String] = [],
         status: String = "captured",
@@ -146,11 +159,28 @@ public struct CommentRecord: Codable, Equatable, Identifiable, Sendable {
         self.pageIndex = pageIndex
         self.pageLabel = pageLabel
         self.verbatim = verbatim
+        self.kind = kind
         self.captureMethod = captureMethod
         self.tags = tags
         self.status = status
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
+    }
+
+    // Decoded by hand so that sessions written before `kind` existed still load.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        highlightID = try container.decodeIfPresent(UUID.self, forKey: .highlightID)
+        pageIndex = try container.decodeIfPresent(Int.self, forKey: .pageIndex)
+        pageLabel = try container.decodeIfPresent(String.self, forKey: .pageLabel)
+        verbatim = try container.decode(String.self, forKey: .verbatim)
+        kind = try container.decodeIfPresent(Kind.self, forKey: .kind) ?? .discuss
+        captureMethod = try container.decodeIfPresent(CaptureMethod.self, forKey: .captureMethod) ?? .typed
+        tags = try container.decodeIfPresent([String].self, forKey: .tags) ?? []
+        status = try container.decodeIfPresent(String.self, forKey: .status) ?? "captured"
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
     }
 }
 

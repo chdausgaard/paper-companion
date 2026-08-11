@@ -36,7 +36,7 @@ public enum MarkdownExporter {
                 lines.append("")
             } else {
                 for comment in linked {
-                    lines.append("### Comment `\(comment.id.uuidString)`")
+                    lines.append("### \(label(for: comment)) `\(comment.id.uuidString)`")
                     lines.append("")
                     lines.append(comment.verbatim)
                     lines.append("")
@@ -56,7 +56,7 @@ public enum MarkdownExporter {
             lines.append("")
             for comment in standalone {
                 let page = comment.pageLabel.map { " · Page \($0)" } ?? ""
-                lines.append("### Comment `\(comment.id.uuidString)`\(page)")
+                lines.append("### \(label(for: comment)) `\(comment.id.uuidString)`\(page)")
                 lines.append("")
                 if let highlightID = comment.highlightID {
                     lines.append("_Original highlight `\(highlightID.uuidString)` is no longer active._")
@@ -103,6 +103,10 @@ public enum MarkdownExporter {
             lines.append("")
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    private static func label(for comment: CommentRecord) -> String {
+        comment.kind == .quiet ? "Margin note" : "Comment"
     }
 
     private static func blockquote(_ text: String) -> [String] {

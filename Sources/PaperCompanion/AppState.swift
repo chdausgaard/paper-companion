@@ -21,6 +21,7 @@ final class AppState: ObservableObject {
     @Published var searchQuery = ""
     @Published var searchRequestID = UUID()
     @Published var navigationPageIndex: Int?
+    @Published var navigationHighlightID: UUID?
     @Published var navigationRequestID = UUID()
     @Published var statusMessage = "Open a PDF to begin"
     @Published var errorMessage: String?
@@ -106,6 +107,7 @@ final class AppState: ObservableObject {
             currentPageLabel = pdfDocument.page(at: currentPageIndex)?.label ?? String(currentPageIndex + 1)
             currentPageText = pdfDocument.page(at: currentPageIndex)?.string ?? ""
             navigationPageIndex = currentPageIndex
+            navigationHighlightID = nil
             navigationRequestID = UUID()
             statusMessage = "Session ready · \(pdfDocument.pageCount) pages"
             refreshAgentFiles()
@@ -205,7 +207,7 @@ final class AppState: ObservableObject {
         }
     }
 
-    func addComment(linkToHighlight: Bool) {
+    func addComment(linkToHighlight: Bool, kind: CommentRecord.Kind = .discuss) {
         let text = commentDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else {
             statusMessage = "Type or dictate a comment first"
@@ -228,19 +230,38 @@ final class AppState: ObservableObject {
             highlightID: linkedHighlight?.id,
             pageIndex: linkedHighlight?.pageIndex ?? currentPageIndex,
             pageLabel: linkedHighlight?.pageLabel ?? currentPageLabel,
-            verbatim: text
+            verbatim: text,
+            kind: kind
         )
         comments.append(comment)
         do {
-            try persistState(eventKind: "comment_created", recordID: comment.id, origin: "typed")
+            // The event kind is what an agent watcher keys on: a margin note is
+            // journalled under a name that does not match its comment trigger.
+            try persistState(
+                eventKind: kind == .quiet ? "quicknote_created" : "comment_created",
+                recordID: comment.id,
+                origin: "typed"
+            )
             commentDraft = ""
-            statusMessage = linkedHighlight == nil
-                ? "Page-only comment saved · visible under Saved comments"
-                : "Comment linked to highlighted text · visible under Saved comments"
+            if kind == .quiet {
+                statusMessage = "Margin note saved · page \(comment.pageLabel ?? currentPageLabel) · not sent to the agent"
+            } else {
+                statusMessage = linkedHighlight == nil
+                    ? "Page-only comment saved · visible under Saved comments"
+                    : "Comment linked to highlighted text · visible under Saved comments"
+            }
         } catch {
             comments.removeAll { $0.id == comment.id }
             errorMessage = "Could not save the comment: \(error.localizedDescription)"
         }
+    }
+
+    /// A margin note: anchored like any other comment, but journalled so the
+    /// agent records it without responding. Links to the current selection or
+    /// highlight when there is one, so the anchor is not lost.
+    func addQuickNote() {
+        let hasAnchor = selectedHighlight != nil || currentSelection != nil
+        addComment(linkToHighlight: hasAnchor, kind: .quiet)
     }
 
     func saveNotes() {
@@ -391,6 +412,7 @@ final class AppState: ObservableObject {
     func selectHighlight(_ highlight: HighlightRecord) {
         selectedHighlightID = highlight.id
         navigationPageIndex = highlight.pageIndex
+        navigationHighlightID = highlight.id
         navigationRequestID = UUID()
         do {
             let context = CurrentContext(
@@ -420,6 +442,7 @@ final class AppState: ObservableObject {
         }
         guard let pageIndex = comment.pageIndex else { return }
         navigationPageIndex = pageIndex
+        navigationHighlightID = nil
         navigationRequestID = UUID()
         statusMessage = "Page-only comment · page \(comment.pageLabel ?? String(pageIndex + 1))"
     }
