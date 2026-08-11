@@ -59,12 +59,24 @@ swift build
 swift test
 ```
 
-Package a local `.app`:
+Package a local `.app`, then install it:
 
 ```bash
 chmod +x scripts/package-app.sh
-scripts/package-app.sh
+scripts/package-app.sh                     # prints the bundle path
+rm -rf /Applications/PaperCompanion.app
+cp -R ~/Library/Caches/PaperCompanion/build/PaperCompanion.app /Applications/
 ```
+
+The bundle is built under `~/Library/Caches/PaperCompanion/build` rather than
+inside the repo on purpose. An `.app` anywhere in the home folder's indexed
+areas is registered by LaunchServices, so Alfred and Spotlight offer the build
+alongside the installed copy. `~/Library` is not scanned, which keeps
+`/Applications/PaperCompanion.app` the only hit. Pass a path as the first
+argument to write the bundle elsewhere.
+
+The version comes from `VERSION`; bump `CFBundleVersion` in
+`support/Info.plist.in` alongside it.
 
 ## Known prototype limitations
 

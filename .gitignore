@@ -1,4 +1,5 @@
 .build/
+# packaged builds now go to ~/Library/Caches/PaperCompanion/build
 dist/
 .DS_Store
 *.xcuserstate

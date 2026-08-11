@@ -2,7 +2,11 @@
 set -euo pipefail
 
 PACKAGE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEFAULT_OUTPUT_ROOT="$PACKAGE_ROOT/dist"
+# Outside the home folder's indexed areas on purpose: an .app bundle sitting in
+# the repo gets picked up by LaunchServices, so Alfred and Spotlight offer the
+# build alongside the copy installed in /Applications. ~/Library is not scanned.
+# (.metadata_never_index does not prevent this — app bundles are indexed anyway.)
+DEFAULT_OUTPUT_ROOT="$HOME/Library/Caches/PaperCompanion/build"
 OUTPUT_ROOT="${1:-$DEFAULT_OUTPUT_ROOT}"
 APP_NAME="PaperCompanion"
 APP_VERSION="$(tr -d '[:space:]' < "$PACKAGE_ROOT/VERSION")"
@@ -17,8 +21,11 @@ if [[ ! -x "$EXECUTABLE" ]]; then
   exit 1
 fi
 
+mkdir -p "$OUTPUT_ROOT"
+
 if [[ -e "$APP_BUNDLE" ]]; then
-  # dist/ is a disposable build directory; anything else is the user's, so refuse.
+  # The default output is a disposable build directory; anything else is the
+  # user's own, so refuse to overwrite it.
   if [[ "$OUTPUT_ROOT" == "$DEFAULT_OUTPUT_ROOT" ]]; then
     rm -rf "$APP_BUNDLE"
   else
