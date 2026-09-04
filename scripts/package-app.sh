@@ -11,10 +11,21 @@ OUTPUT_ROOT="${1:-$DEFAULT_OUTPUT_ROOT}"
 APP_NAME="PaperCompanion"
 APP_VERSION="$(tr -d '[:space:]' < "$PACKAGE_ROOT/VERSION")"
 APP_BUNDLE="$OUTPUT_ROOT/$APP_NAME.app"
-EXECUTABLE="$PACKAGE_ROOT/.build/release/$APP_NAME"
 
 cd "$PACKAGE_ROOT"
-swift build -c release
+
+# A plain release build is native-only, so a bundle built on Apple Silicon will
+# not launch on an Intel Mac. Set UNIVERSAL=1 for anything you hand to someone
+# else; local iteration stays single-arch because the universal build is roughly
+# twice as slow. Note the differing output paths: --arch moves the product into
+# .build/apple/Products/Release.
+if [[ "${UNIVERSAL:-0}" == "1" ]]; then
+  swift build -c release --arch arm64 --arch x86_64
+  EXECUTABLE="$PACKAGE_ROOT/.build/apple/Products/Release/$APP_NAME"
+else
+  swift build -c release
+  EXECUTABLE="$PACKAGE_ROOT/.build/release/$APP_NAME"
+fi
 
 if [[ ! -x "$EXECUTABLE" ]]; then
   echo "Release executable not found: $EXECUTABLE" >&2
@@ -44,5 +55,6 @@ plutil -lint "$APP_BUNDLE/Contents/Info.plist"
 codesign --force --deep --sign - "$APP_BUNDLE"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 test -x "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
+lipo -archs "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 
 echo "$APP_BUNDLE"
