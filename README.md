@@ -8,7 +8,34 @@ Paper Companion is a local-first macOS reader for academic PDFs. It combines nat
 - Apple Silicon or Intel Mac supported by the installed Swift toolchain
 - Xcode Command Line Tools to build from source
 
-The packaged prototype is ad-hoc signed for local use. It is not Developer ID signed or notarized for general distribution.
+## Install
+
+There is no download. You build Paper Companion on your own Mac, which takes
+about a minute and avoids Gatekeeper entirely: macOS quarantines applications
+that arrive over the network, not ones you compile yourself, so the app you
+build here opens on a double-click with no warning. A downloaded build would
+not, because this prototype is ad-hoc signed rather than Developer ID signed
+and notarized.
+
+If you have never built anything on this Mac, install Apple's compiler tools
+first. This is a one-time system dialog, roughly 1.5 GB, and needs no Apple ID
+or payment. It is not the full Xcode application.
+
+```bash
+xcode-select --install
+```
+
+Then:
+
+```bash
+git clone https://github.com/chdausgaard/paper-companion
+cd paper-companion
+./scripts/package-app.sh --install
+```
+
+The app lands in `/Applications`. To update later, quit it, then `git pull` and
+run the same command again — the script refuses to replace a running copy
+rather than corrupting the install.
 
 ## Core workflow
 
@@ -59,14 +86,23 @@ swift build
 swift test
 ```
 
-Package a local `.app`, then install it:
+Package a local `.app`:
 
 ```bash
-chmod +x scripts/package-app.sh
-scripts/package-app.sh                     # prints the bundle path
-rm -rf /Applications/PaperCompanion.app
-cp -R ~/Library/Caches/PaperCompanion/build/PaperCompanion.app /Applications/
+scripts/package-app.sh                 # build and package; prints the bundle path
+scripts/package-app.sh --install       # ...and copy it to /Applications
+scripts/package-app.sh --help          # all options
+UNIVERSAL=1 scripts/package-app.sh     # arm64 + x86_64, for a bundle you hand to someone else
 ```
+
+`--install` replaces an existing Paper Companion without asking, since
+reinstalling over the previous version is the normal case, but refuses to
+delete any other application that happens to share the name unless you pass
+`--force`. It also refuses while the app is running.
+
+A plain build is native-only and will not launch on the other architecture, so
+use `UNIVERSAL=1` for anything leaving this machine. The script prints the
+architectures it actually bundled.
 
 The bundle is built under `~/Library/Caches/PaperCompanion/build` rather than
 inside the repo on purpose. An `.app` anywhere in the home folder's indexed
