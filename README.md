@@ -17,9 +17,15 @@ build here opens on a double-click with no warning. A downloaded build would
 not, because this prototype is ad-hoc signed rather than Developer ID signed
 and notarized.
 
+Every command below is typed into Terminal, the macOS command-line app. It is
+in Applications → Utilities, or press ⌘Space and type "Terminal". Paste one
+block at a time and press Return; some will print a lot of output, which is
+normal.
+
 If you have never built anything on this Mac, install Apple's compiler tools
 first. This is a one-time system dialog, roughly 1.5 GB, and needs no Apple ID
-or payment. It is not the full Xcode application.
+or payment. It is not the full Xcode application. If they are already
+installed, the command simply says so and does nothing.
 
 ```bash
 xcode-select --install
@@ -33,9 +39,24 @@ cd paper-companion
 ./scripts/package-app.sh --install
 ```
 
-The app lands in `/Applications`. To update later, quit it, then `git pull` and
-run the same command again — the script refuses to replace a running copy
-rather than corrupting the install.
+About a minute of build output scrolls past, ending in a line beginning
+`Installed PaperCompanion`. The app is then in `/Applications` — open it from
+there, or with ⌘Space.
+
+### Updating
+
+Quit Paper Companion first. Then, from the same `paper-companion` folder you
+cloned into:
+
+```bash
+git pull
+./scripts/package-app.sh --install
+```
+
+If you forget to quit it, the script says so and stops, rather than replacing
+the running app and corrupting the install. Nothing you have written is
+affected either way: reading sessions live in `~/Documents/Paper Companion
+Sessions` and are never touched by an update.
 
 ## Core workflow
 
