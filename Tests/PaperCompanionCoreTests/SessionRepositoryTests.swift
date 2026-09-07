@@ -204,3 +204,64 @@ final class SessionRepositoryTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: manifest), malformed)
     }
 }
+
+extension SessionRepositoryTests {
+    func testManifestWithoutReadingModeLoadsAsPreread() throws {
+        let json = """
+        {
+          "createdAt" : "2026-08-14T12:00:00Z",
+          "id" : "5B6E4F1A-1111-4C2B-9D3E-000000000001",
+          "lastPageIndex" : 7,
+          "pageCount" : 30,
+          "schemaVersion" : 1,
+          "sourcePDFFingerprint" : "abc",
+          "sourcePDFPath" : "/tmp/x.pdf",
+          "title" : "Old session",
+          "updatedAt" : "2026-08-14T12:00:00Z"
+        }
+        """
+        let manifest = try JSONDecoder.paperCompanion.decode(SessionManifest.self, from: Data(json.utf8))
+        XCTAssertEqual(manifest.readingMode, .preread)
+        XCTAssertEqual(manifest.furthestPageIndex, 7, "furthest page can never be behind the last page opened")
+    }
+
+    func testAgentInstructionsFollowReadingMode() {
+        let together = repository.agentInstructions(toolkitPath: nil, causalInferencePath: nil, readingMode: .together)
+        XCTAssertTrue(together.contains("**This session is in `together` mode.**"))
+        XCTAssertTrue(together.contains("furthestPageIndex"))
+        XCTAssertTrue(together.contains("agent/replies/<commentID>.md"))
+
+        let preread = repository.agentInstructions(toolkitPath: nil, causalInferencePath: nil)
+        XCTAssertTrue(preread.contains("**This session is in `preread` mode.**"))
+    }
+
+    func testAgentRepliesAreReadByCommentID() throws {
+        let paths = SessionPaths(root: temporaryDirectory.appendingPathComponent("s.reading"))
+        let id = UUID()
+        try repository.writeText("Verdict: **worth raising**.\n", to: paths.agentReplies.appendingPathComponent("\(id.uuidString).md"))
+        try repository.writeText("ignored", to: paths.agentReplies.appendingPathComponent("notes.md"))
+        try repository.writeText("", to: paths.agentReplies.appendingPathComponent("\(UUID().uuidString).md"))
+
+        let replies = repository.readAgentReplies(paths: paths)
+
+        XCTAssertEqual(replies, [id: "Verdict: **worth raising**."])
+        XCTAssertFalse(repository.agentFilesFingerprint(paths: paths).isEmpty)
+    }
+
+    func testChangingReadingModeRewritesInstructions() throws {
+        let pdfURL = temporaryDirectory.appendingPathComponent("mode.pdf")
+        try Data("%PDF-1.4\nmode\n%%EOF".utf8).write(to: pdfURL)
+        var loaded = try repository.createOrLoadSession(
+            pdfURL: pdfURL, title: "Mode", pageCount: 3, extractedText: "",
+            sessionsRoot: temporaryDirectory.appendingPathComponent("Sessions")
+        )
+        XCTAssertTrue(try String(contentsOf: loaded.paths.agentInstructions).contains("`preread` mode"))
+
+        loaded.manifest.readingMode = .together
+        try repository.writeAgentInstructions(manifest: loaded.manifest, paths: loaded.paths)
+        try repository.saveState(manifest: loaded.manifest, highlights: [], comments: [], notes: "", paths: loaded.paths)
+
+        XCTAssertTrue(try String(contentsOf: loaded.paths.agentInstructions).contains("`together` mode"))
+        XCTAssertEqual(try repository.loadSession(at: loaded.paths.root).manifest.readingMode, .together)
+    }
+}

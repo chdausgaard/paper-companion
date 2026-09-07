@@ -22,7 +22,17 @@ public struct SessionPaths: Equatable, Sendable {
     public var sharedUnderstanding: URL { root.appendingPathComponent("agent/shared-understanding.md") }
     public var transcript: URL { root.appendingPathComponent("agent/transcript.md") }
     public var excursions: URL { root.appendingPathComponent("agent/excursions", isDirectory: true) }
+    /// One Markdown file per answered comment, named by the comment's UUID.
+    /// The app shows each under the comment it answers.
+    public var agentReplies: URL { root.appendingPathComponent("agent/replies", isDirectory: true) }
     public var agentInstructions: URL { root.appendingPathComponent("AGENTS.md") }
+    /// Copy of the paper with highlights and comments embedded as PDF
+    /// annotations, regenerated whenever they change. Named after the source
+    /// file so it is recognisable in the session folder.
+    public func annotatedPDF(for manifest: SessionManifest) -> URL {
+        let base = URL(fileURLWithPath: manifest.sourcePDFPath).deletingPathExtension().lastPathComponent
+        return root.appendingPathComponent("\(base.isEmpty ? "paper" : base)-annotated.pdf")
+    }
     /// Derived copies of the paper — `pdf2md` output, rendered figures. Keeps
     /// the user's own folder free of conversion clutter.
     public var cache: URL { root.appendingPathComponent("cache", isDirectory: true) }
@@ -173,7 +183,11 @@ public struct SessionRepository {
         try writeText(initialSharedUnderstanding(title: title), to: paths.sharedUnderstanding)
         try writeText("# Agent transcript\n\n", to: paths.transcript)
         try writeText(
-            agentInstructions(toolkitPath: pdfToolkitPath, causalInferencePath: causalInferencePath),
+            agentInstructions(
+                toolkitPath: pdfToolkitPath,
+                causalInferencePath: causalInferencePath,
+                readingMode: manifest.readingMode
+            ),
             to: paths.agentInstructions
         )
         try writeText(MarkdownExporter.renderComments(title: title, highlights: [], comments: []), to: paths.commentsMarkdown)
@@ -211,13 +225,7 @@ public struct SessionRepository {
         try createDirectories(paths)
         // A session carried to another Mac keeps the path recorded when it was
         // created; prefer it only while it still resolves there.
-        let toolkit = manifest.pdfToolkitPath.flatMap {
-            fileManager.fileExists(atPath: $0) ? $0 : nil
-        } ?? UserReferences.pdfToolkit
-        try writeText(
-            agentInstructions(toolkitPath: toolkit, causalInferencePath: UserReferences.causalInference),
-            to: paths.agentInstructions
-        )
+        try writeAgentInstructions(manifest: manifest, paths: paths)
 
         return LoadedSession(
             manifest: manifest,
@@ -244,6 +252,64 @@ public struct SessionRepository {
             MarkdownExporter.renderComments(title: manifest.title, highlights: highlights, comments: comments),
             to: paths.commentsMarkdown
         )
+    }
+
+    /// Rewrites the app-owned `AGENTS.md` for the manifest's reading mode.
+    /// Called on every load and whenever the mode changes mid-session.
+    public func writeAgentInstructions(manifest: SessionManifest, paths: SessionPaths) throws {
+        // A session carried to another Mac keeps the path recorded when it was
+        // created; prefer it only while it still resolves there.
+        let toolkit = manifest.pdfToolkitPath.flatMap {
+            fileManager.fileExists(atPath: $0) ? $0 : nil
+        } ?? UserReferences.pdfToolkit
+        try writeText(
+            agentInstructions(
+                toolkitPath: toolkit,
+                causalInferencePath: UserReferences.causalInference,
+                readingMode: manifest.readingMode
+            ),
+            to: paths.agentInstructions
+        )
+    }
+
+    /// Agent replies keyed by comment ID, read from `agent/replies/<UUID>.md`.
+    /// Files whose name is not a UUID are ignored.
+    public func readAgentReplies(paths: SessionPaths) -> [UUID: String] {
+        guard let names = try? fileManager.contentsOfDirectory(atPath: paths.agentReplies.path) else {
+            return [:]
+        }
+        var replies: [UUID: String] = [:]
+        for name in names where name.lowercased().hasSuffix(".md") {
+            let stem = String(name.dropLast(3))
+            guard let id = UUID(uuidString: stem) else { continue }
+            let url = paths.agentReplies.appendingPathComponent(name)
+            if let text = try? String(contentsOf: url, encoding: .utf8) {
+                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty { replies[id] = trimmed }
+            }
+        }
+        return replies
+    }
+
+    /// Newest modification date under `agent/`, used to notice agent writes
+    /// without a file-system watcher.
+    public func agentFilesFingerprint(paths: SessionPaths) -> String {
+        var parts: [String] = []
+        let candidates = [paths.sharedUnderstanding, paths.transcript]
+        for url in candidates {
+            let date = (try? fileManager.attributesOfItem(atPath: url.path)[.modificationDate] as? Date) ?? .distantPast
+            parts.append("\(url.lastPathComponent):\(date.timeIntervalSince1970)")
+        }
+        if let names = try? fileManager.contentsOfDirectory(atPath: paths.agentReplies.path) {
+            for name in names.sorted() {
+                let url = paths.agentReplies.appendingPathComponent(name)
+                let attributes = try? fileManager.attributesOfItem(atPath: url.path)
+                let date = (attributes?[.modificationDate] as? Date) ?? .distantPast
+                let size = (attributes?[.size] as? Int) ?? 0
+                parts.append("\(name):\(date.timeIntervalSince1970):\(size)")
+            }
+        }
+        return parts.joined(separator: "|")
     }
 
     public func writeCurrentContext(_ context: CurrentContext, paths: SessionPaths) throws {
@@ -285,6 +351,7 @@ public struct SessionRepository {
             paths.eventLog.deletingLastPathComponent(),
             paths.sharedUnderstanding.deletingLastPathComponent(),
             paths.excursions,
+            paths.agentReplies,
             paths.cache
         ]
         for directory in directories {
@@ -363,6 +430,26 @@ public struct SessionRepository {
         """
     }
 
+    /// The mode is repeated in `bridge/current-context.json` because the user
+    /// can switch it mid-session; the file is what the agent re-reads.
+    private func readingModeSection(_ mode: ReadingMode) -> String {
+        let current: String
+        switch mode {
+        case .preread:
+            current = "**This session is in `preread` mode.**"
+        case .together:
+            current = "**This session is in `together` mode.**"
+        }
+        return """
+        ## Reading mode
+
+        \(current) `session.json` and `bridge/current-context.json` both carry `readingMode`; the user can switch it mid-session, so re-check the context file when it changes.
+
+        - **`preread`** — the workflow under Session start: offer the pre-read sub-agent, convert once into `cache/`, fill the map early so comments are interpreted against the real design.
+        - **`together`** — you discover the paper with the user rather than ahead of him. No pre-read, no `pdf2md` at session start, and no reading past `furthestPageIndex` (zero-based, in both files). Your material is what he has seen: each comment's highlight `quote` with its stored `prefix` and `suffix` (roughly 500 characters either side, in `state/highlights.json`), and the pages up to and including the furthest one he has opened — read those with `pdfread` when a comment needs more than its snippet. Respond to the passage as it stands. When the answer may come later in the paper, say that it is open rather than treating it as a gap, and bank it to check when he gets there. Build `agent/shared-understanding.md` incrementally as sections are reached; a section not yet reached stays empty rather than being filled from the abstract. If he asks you to read ahead, or switches to `preread`, the restriction lifts from that point.
+        """
+    }
+
     /// Named routing when the reference is on this machine; the discipline
     /// without the routing when it is not.
     private func methodsReferenceSection(causalInferencePath: String?) -> String {
@@ -385,7 +472,11 @@ public struct SessionRepository {
         """
     }
 
-    func agentInstructions(toolkitPath: String?, causalInferencePath: String?) -> String {
+    func agentInstructions(
+        toolkitPath: String?,
+        causalInferencePath: String?,
+        readingMode: ReadingMode = .preread
+    ) -> String {
         let toolkit = toolkitPath ?? "the user's configured PDF toolkit"
         return """
         # Paper Companion reading-session protocol
@@ -399,19 +490,21 @@ public struct SessionRepository {
         3. Read `agent/shared-understanding.md` only when cumulative context is needed. Read its Reference detail section only when you need a specification or a number.
         4. Use the PDF extraction protocol at `\(toolkit)` for substantive PDF reading. Do not treat `document-text.txt` as authoritative for complex layouts, tables, figures, or scans.
 
+        \(readingModeSection(readingMode))
+
         \(methodsReferenceSection(causalInferencePath: causalInferencePath))
 
         ## Ownership
 
-        - The app owns `session.json`, `state/`, `journal/`, `notes.md`, `comments.md`, `document-text.txt`, and `bridge/current-context.*`. Do not edit them.
-        - You may edit only `agent/transcript.md`, `agent/shared-understanding.md`, and files below `agent/excursions/` and `cache/`.
+        - The app owns `session.json`, `state/`, `journal/`, `notes.md`, `comments.md`, `document-text.txt`, `bridge/current-context.*`, and `<paper>-annotated.pdf`. Do not edit them. The annotated PDF is a copy of the paper with the highlights and comments embedded for other viewers; it is regenerated from `state/` and `agent/replies/`, so read the JSON, not the PDF, for records.
+        - You may edit only `agent/transcript.md`, `agent/shared-understanding.md`, and files below `agent/replies/`, `agent/excursions/`, and `cache/`.
         - `cache/` holds derived copies of the paper — `pdf2md` output as `cache/paper.md`, rendered figure images. Everything derived from the PDF goes here, never beside the user's original PDF.
         - Preserve dictated comments verbatim in `agent/transcript.md`. Put your interpretation in a separate labeled paragraph.
         - This file is generated by the app. To change the protocol for future sessions, edit the template in `Sources/PaperCompanionCore/SessionRepository.swift`, not the copy inside a session.
 
         ## Session start
 
-        Do these before the user starts reading. Do not make the user drive the plumbing.
+        Do these before the user starts reading. Do not make the user drive the plumbing. Steps 2 and 3 apply in `preread` mode only; in `together` mode skip them — see Reading mode.
 
         1. **Arm a comment watcher.** Poll `journal/events.jsonl` for lines whose `kind` starts with `comment` or `note`, emitting one event per new record. Keep a change-hash of `state/comments.json` as a fallback in case a write is not journalled. A background monitor is correct here; the user should never have to ping you that a comment exists. Margin notes are journalled as `quicknote_created` and are deliberately excluded — see Comment kinds.
         2. **Offer a pre-read.** A named, resumable sub-agent that reads the paper and fills `agent/shared-understanding.md` is worth the tokens: it grounds every later interpretation and keeps the paper text out of the main context. It must leave `## User's emerging assessment` and `## Recurring concerns and cross-links` empty. Propose it and wait for approval.
@@ -440,6 +533,10 @@ public struct SessionRepository {
         Margin notes exist because the cost of a comment had been suppressing them. The user was silently not writing down "nice explanation" or "this table is unreadable" because each one would spin up an evaluation he did not want. Those small reactions are exactly the raw material a discussant needs later — what he found clear, what irritated him, where he lost the thread — so treat quiet notes as evidence, not as noise.
 
         Read them when you write the synthesis: a cluster of margin notes on one section is a signal about that section, and a note that turns out to bear on a drafted comment can be used. Two rules when you do. Attribute a margin note as a reaction, never as a considered position. And if a quiet note looks like it is actually a serious problem the user has under-weighted, raise it once, at synthesis time, flagged as coming from a margin note — not in the moment.
+
+        ## Replies the app shows
+
+        For every `discuss` comment, write your response to `agent/replies/<commentID>.md` — the comment's `id` from `state/comments.json`, uppercase, plus `.md` — as plain Markdown, in addition to the transcript entry. The app watches that folder and shows the file directly under the comment it answers, next to the passage, so this is the version the user actually reads. Lead with the verdict, keep it to a few lines, and overwrite the file if your view changes later. Never create a reply file for a `quiet` note.
 
         ## Interaction policy
 

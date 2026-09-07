@@ -61,12 +61,17 @@ Sessions` and are never touched by an update.
 ## Core workflow
 
 1. Open a PDF with **⌘O**.
-2. Select text and press **⇧⌘H**, or enable **Auto-highlight selections** for drag-to-highlight reading. Remove a highlight from the Highlights tab; **⌘Z** restores the latest highlight change.
-3. In Notes, choose **Highlight + save** for a quote-linked comment, or **Save page-only** for a comment anchored only to the current page. Saved comments remain visible in the app.
+2. Select text and press **⇧⌘H**, or enable **Auto-highlight selections** for drag-to-highlight reading. Click a highlight in the PDF or in the list and press **⌫** to remove it and its linked comments. Right-click a highlight to change its color or delete it; colors are saved and included in the annotated PDF. **⌘Z** restores the latest highlight or comment change.
+3. Type a comment in the composer under the Annotations list and press **⌘↩**. With a selection or an active highlight it saves linked to that passage; otherwise it is anchored to the current page. **⇧⌘↩** forces a page-only comment.
 4. Press **⇧⌘M** for a **margin note** — anchored and recorded like any comment, but journalled so the agent files it without responding. This is for the reactions that are not worth a conversation: *nice explanation*, *this table is unreadable*, *lost the thread here*. They are read back at synthesis time, where a cluster of them on one section is itself a finding.
-5. Keep document-level, unanchored Markdown notes in the Notes tab or detachable Notes window. The three Notes sections have draggable dividers.
-6. Copy the agent prompt to discuss the current page, selection, highlights, and comments in your existing agent client.
-7. Use the Highlights tab to return to passages. Clicking a highlight scrolls to the passage itself and tints it, rather than stopping at the top of its page.
+5. The **Annotations** list shows every highlight and comment in paper order — the order of the passages, not the order you wrote them. Click an entry to expand it to full text and scroll the PDF to its passage; click a highlight in the PDF to select and expand its entry. Expanded comments can be edited in place with the pencil button. Agent replies appear under the comment they answer.
+6. Keep document-level, unanchored Markdown notes in the Notes tab. The detachable Notes window carries the composer and document notes so the sidebar can stay on the list.
+7. Choose a **reading mode** in the Agent tab (or the Agent menu) and copy the agent prompt into your existing agent client.
+
+### Reading modes
+
+- **Agent pre-reads** (default): the agent reads the whole paper first and fills `agent/shared-understanding.md` before you comment, so comments are interpreted against the real design.
+- **Discover together**: the agent reads only what you have reached. It answers from each highlight's quote and the stored text around it, may read the pages up to the furthest one you have opened, and never reads ahead. Its map of the paper fills in as you get there. Switch at any time; the mode is written to `session.json` and `bridge/current-context.json`, and `AGENTS.md` is regenerated so a running agent picks the change up.
 
 The original PDF is never written or modified. Highlight rendering comes from sidecar records.
 
@@ -82,11 +87,13 @@ Important files:
 
 - `notes.md`: your unanchored, document-level free-form notes.
 - `comments.md`: generated readable projection of highlights, linked comments, and page-only comments.
+- `<paper>-annotated.pdf`: a copy of the paper with highlights and comments embedded as standard PDF annotations, so they show in Preview, Acrobat, Skim, or a Zotero import. Regenerated about a second after any highlight, comment, or agent reply changes; **File → Reveal Annotated PDF** finds it. It is a projection, not a record: edits made to it in other apps are not read back.
 - `state/comments.json`: structured source of truth for both comment types.
 - `state/highlights.json`: app-owned highlight geometry and exact quotations.
 - `bridge/current-context.json`: small, current page/selection snapshot for agents.
 - `AGENTS.md`: instructions for an external filesystem-capable agent.
 - `agent/transcript.md`: agent-owned verbatim comment transcript.
+- `agent/replies/<commentID>.md`: agent-owned reply to one comment. The app polls this folder and shows each reply under its comment.
 - `agent/shared-understanding.md`: agent-owned evolving interpretation.
 - `agent/excursions/`: scoped research side trips, including the workshop synthesis.
 - `cache/`: agent-owned derived copies of the paper — `pdf2md` output as `cache/paper.md`, rendered figure pages. Keeps conversions out of the folder holding the original PDF.
@@ -138,13 +145,21 @@ The version comes from `VERSION`; bump `CFBundleVersion` in
 ## Known prototype limitations
 
 - Text selection quality depends on the PDF text layer; OCR is not included.
-- Highlights are sidecars and are not embedded back into the PDF.
+- Highlights are embedded only into the annotated copy in the session folder, never into the original, and annotations made in other apps are not imported.
 - Agent integration is file-based. Paper Companion does not start, authenticate, or message an agent.
 - Voice capture stays in your existing agent/client.
-- The Agent tab reloads agent-owned files when you press Refresh; it does not yet watch them continuously.
+- Agent-owned files are polled every 1.5 seconds rather than watched; a reply can take that long to appear.
 - Direct external edits to `notes.md` while the app is open can be overwritten by a later in-app save.
 - The app does not yet re-anchor sidecar highlights if the source PDF changes; the source fingerprint creates a separate session instead.
 
 ## Privacy
 
 The app itself performs no network requests. For unpublished workshop papers, remember that asking an external agent to read the PDF or quotations may send that material to the agent provider. The generated agent instructions default literature excursions to decontextualized questions unless you explicitly permit sharing paper identity or text.
+
+### Library, updates, and feedback
+
+The opening screen lists up to 50 recent papers. Existing reading sessions are imported on first use. Choose a paper to resume its saved reading position, highlights, and notes, or use the **Library** toolbar button to return to the list. Removing a recent entry leaves the PDF and session files untouched.
+
+Paper Companion checks public GitHub releases at launch. **Paper Companion → Check for Updates…** checks manually. An available update opens the release page for download and manual installation; this is not an automatic installer. **What’s New** appears on the first launch of this feature and after a version/build change, and is also available from the app menu.
+
+The **Request Feature** toolbar button (also in **Help**) opens a prefilled GitHub issue. You can review and submit it in your browser; a GitHub account is required.

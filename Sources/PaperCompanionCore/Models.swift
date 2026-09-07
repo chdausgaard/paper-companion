@@ -184,6 +184,22 @@ public struct CommentRecord: Codable, Equatable, Identifiable, Sendable {
     }
 }
 
+/// Whether the agent reads the paper ahead of the user or discovers it with him.
+public enum ReadingMode: String, Codable, Sendable, CaseIterable {
+    /// The agent pre-reads the paper and fills the map before comments arrive.
+    case preread
+    /// The agent reads only what the user has reached: highlight snippets and
+    /// the pages up to the furthest one opened. Nothing ahead.
+    case together
+
+    public var title: String {
+        switch self {
+        case .preread: return "Agent pre-reads"
+        case .together: return "Discover together"
+        }
+    }
+}
+
 public struct SessionManifest: Codable, Equatable, Sendable {
     public var schemaVersion: Int
     public var id: UUID
@@ -192,6 +208,10 @@ public struct SessionManifest: Codable, Equatable, Sendable {
     public var sourcePDFFingerprint: String
     public var pageCount: Int
     public var lastPageIndex: Int
+    /// Highest page index the user has opened in this session. In `together`
+    /// mode the agent must not read past it.
+    public var furthestPageIndex: Int
+    public var readingMode: ReadingMode
     public var createdAt: Date
     public var updatedAt: Date
     public var pdfToolkitPath: String?
@@ -204,6 +224,8 @@ public struct SessionManifest: Codable, Equatable, Sendable {
         sourcePDFFingerprint: String,
         pageCount: Int,
         lastPageIndex: Int = 0,
+        furthestPageIndex: Int = 0,
+        readingMode: ReadingMode = .preread,
         createdAt: Date = Date(),
         updatedAt: Date? = nil,
         pdfToolkitPath: String? = nil
@@ -215,9 +237,32 @@ public struct SessionManifest: Codable, Equatable, Sendable {
         self.sourcePDFFingerprint = sourcePDFFingerprint
         self.pageCount = pageCount
         self.lastPageIndex = lastPageIndex
+        self.furthestPageIndex = max(furthestPageIndex, lastPageIndex)
+        self.readingMode = readingMode
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
         self.pdfToolkitPath = pdfToolkitPath
+    }
+
+    // Decoded by hand so sessions written before `readingMode` and
+    // `furthestPageIndex` existed still load.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        id = try container.decode(UUID.self, forKey: .id)
+        title = try container.decode(String.self, forKey: .title)
+        sourcePDFPath = try container.decode(String.self, forKey: .sourcePDFPath)
+        sourcePDFFingerprint = try container.decode(String.self, forKey: .sourcePDFFingerprint)
+        pageCount = try container.decode(Int.self, forKey: .pageCount)
+        lastPageIndex = try container.decodeIfPresent(Int.self, forKey: .lastPageIndex) ?? 0
+        furthestPageIndex = max(
+            try container.decodeIfPresent(Int.self, forKey: .furthestPageIndex) ?? 0,
+            lastPageIndex
+        )
+        readingMode = try container.decodeIfPresent(ReadingMode.self, forKey: .readingMode) ?? .preread
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? createdAt
+        pdfToolkitPath = try container.decodeIfPresent(String.self, forKey: .pdfToolkitPath)
     }
 }
 
@@ -233,6 +278,8 @@ public struct CurrentContext: Codable, Equatable, Sendable {
     public var suffix: String
     public var activeHighlightID: UUID?
     public var textStatus: String
+    public var readingMode: ReadingMode
+    public var furthestPageIndex: Int
     public var updatedAt: Date
 
     public init(
@@ -247,6 +294,8 @@ public struct CurrentContext: Codable, Equatable, Sendable {
         suffix: String,
         activeHighlightID: UUID?,
         textStatus: String,
+        readingMode: ReadingMode = .preread,
+        furthestPageIndex: Int = 0,
         updatedAt: Date = Date()
     ) {
         self.schemaVersion = schemaVersion
@@ -260,7 +309,27 @@ public struct CurrentContext: Codable, Equatable, Sendable {
         self.suffix = suffix
         self.activeHighlightID = activeHighlightID
         self.textStatus = textStatus
+        self.readingMode = readingMode
+        self.furthestPageIndex = furthestPageIndex
         self.updatedAt = updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        schemaVersion = try container.decode(Int.self, forKey: .schemaVersion)
+        sessionID = try container.decode(UUID.self, forKey: .sessionID)
+        sourcePDFPath = try container.decode(String.self, forKey: .sourcePDFPath)
+        sourcePDFFingerprint = try container.decode(String.self, forKey: .sourcePDFFingerprint)
+        pageIndex = try container.decode(Int.self, forKey: .pageIndex)
+        pageLabel = try container.decode(String.self, forKey: .pageLabel)
+        selectedText = try container.decodeIfPresent(String.self, forKey: .selectedText)
+        prefix = try container.decodeIfPresent(String.self, forKey: .prefix) ?? ""
+        suffix = try container.decodeIfPresent(String.self, forKey: .suffix) ?? ""
+        activeHighlightID = try container.decodeIfPresent(UUID.self, forKey: .activeHighlightID)
+        textStatus = try container.decode(String.self, forKey: .textStatus)
+        readingMode = try container.decodeIfPresent(ReadingMode.self, forKey: .readingMode) ?? .preread
+        furthestPageIndex = try container.decodeIfPresent(Int.self, forKey: .furthestPageIndex) ?? pageIndex
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
     }
 }
 
@@ -289,6 +358,89 @@ public struct SessionEvent: Codable, Equatable, Identifiable, Sendable {
         self.kind = kind
         self.recordID = recordID
         self.timestamp = timestamp
+    }
+}
+
+/// Where something sits in the paper, for sorting in reading order rather
+/// than creation order.
+///
+/// Within a page the key is the character offset PDFKit assigns to the text,
+/// which follows its reading order and so keeps two-column layouts in sequence
+/// better than geometry would. Anchors without text (page-only comments) sort
+/// to the top of their page.
+public struct ReadingPosition: Comparable, Equatable, Sendable {
+    public var pageIndex: Int
+    public var offset: Int
+    public var createdAt: Date
+
+    public init(pageIndex: Int, offset: Int, createdAt: Date) {
+        self.pageIndex = pageIndex
+        self.offset = offset
+        self.createdAt = createdAt
+    }
+
+    public static func < (lhs: ReadingPosition, rhs: ReadingPosition) -> Bool {
+        if lhs.pageIndex != rhs.pageIndex { return lhs.pageIndex < rhs.pageIndex }
+        if lhs.offset != rhs.offset { return lhs.offset < rhs.offset }
+        return lhs.createdAt < rhs.createdAt
+    }
+}
+
+extension HighlightRecord {
+    public var readingPosition: ReadingPosition {
+        let first = locations.min { $0.pageIndex < $1.pageIndex }
+        let offset = first?.textRanges.map(\.location).min() ?? Int.max
+        return ReadingPosition(
+            pageIndex: first?.pageIndex ?? 0,
+            offset: offset,
+            createdAt: createdAt
+        )
+    }
+}
+
+/// One row of the annotations list: a highlight with the comments linked to
+/// it, or a comment with no active highlight (page-only, or orphaned by a
+/// removed highlight).
+public struct AnnotationEntry: Identifiable, Equatable, Sendable {
+    public var id: UUID
+    public var highlight: HighlightRecord?
+    public var comments: [CommentRecord]
+    public var position: ReadingPosition
+
+    public var pageIndex: Int { position.pageIndex }
+    public var pageLabel: String {
+        highlight?.pageLabel ?? comments.first?.pageLabel ?? String(position.pageIndex + 1)
+    }
+
+    /// Active highlights and comments merged and sorted into reading order.
+    public static func build(highlights: [HighlightRecord], comments: [CommentRecord]) -> [AnnotationEntry] {
+        let active = highlights.filter { $0.deletedAt == nil }
+        let live = comments.filter { $0.status != "deleted" }
+        let activeIDs = Set(active.map(\.id))
+
+        var entries = active.map { highlight in
+            AnnotationEntry(
+                id: highlight.id,
+                highlight: highlight,
+                comments: live
+                    .filter { $0.highlightID == highlight.id }
+                    .sorted { $0.createdAt < $1.createdAt },
+                position: highlight.readingPosition
+            )
+        }
+        for comment in live where comment.highlightID.map({ !activeIDs.contains($0) }) ?? true {
+            entries.append(AnnotationEntry(
+                id: comment.id,
+                highlight: nil,
+                comments: [comment],
+                position: ReadingPosition(
+                    pageIndex: comment.pageIndex ?? 0,
+                    offset: -1,
+                    createdAt: comment.createdAt
+                )
+            ))
+        }
+        return entries.sorted { $0.position < $1.position }
     }
 }
 

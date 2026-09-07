@@ -11,7 +11,15 @@ struct PDFReaderView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> PDFView {
-        let pdfView = PDFView()
+        let pdfView = HighlightClickPDFView()
+        pdfView.onHighlightClick = { [weak state] id in
+            state?.highlightClicked(id)
+        }
+        pdfView.onDeleteKey = { [weak state] in
+            state?.deleteSelectedEntry() ?? false
+        }
+        pdfView.onHighlightDelete = { [weak state] id in state?.deleteHighlight(id) }
+        pdfView.onHighlightColor = { [weak state] id, color in state?.setHighlightColor(id, color: color) }
         pdfView.autoScales = true
         pdfView.displayMode = .singlePageContinuous
         pdfView.displayDirection = .vertical
@@ -45,6 +53,7 @@ struct PDFReaderView: NSViewRepresentable {
             query: state.searchQuery,
             in: pdfView
         )
+        context.coordinator.focusIfNeeded(requestID: state.pdfFocusRequestID, in: pdfView)
     }
 
     @MainActor
@@ -52,8 +61,12 @@ struct PDFReaderView: NSViewRepresentable {
         private weak var pdfView: PDFView?
         private weak var state: AppState?
         private var renderedHighlightSignature = ""
+        private var renderedAnnotations: [UUID: [PDFAnnotation]] = [:]
+        private var renderedSelectedID: UUID?
+        private var renderedColors: [UUID: String] = [:]
         private var lastNavigationRequestID: UUID?
         private var lastSearchRequestID: UUID?
+        private var lastFocusRequestID: UUID?
         private var searchResults: [PDFSelection] = []
         private var searchIndex = 0
         private var lastSearchQuery = ""
@@ -85,44 +98,65 @@ struct PDFReaderView: NSViewRepresentable {
 
         func resetForDocument() {
             renderedHighlightSignature = ""
+            renderedAnnotations = [:]
+            renderedSelectedID = nil
+            renderedColors = [:]
             searchResults = []
             searchIndex = 0
             lastSearchQuery = ""
         }
 
+        /// Adds and removes only what changed. Rebuilding every annotation on
+        /// every selection change made clicking a highlight visibly stutter on
+        /// papers with a hundred of them.
         func renderHighlights(
             _ highlights: [HighlightRecord],
             selectedID: UUID?,
             in pdfView: PDFView
         ) {
             let signature = highlights
-                .map { $0.id.uuidString + ($0.deletedAt == nil ? ":active" : ":deleted") }
+                .map { $0.id.uuidString + $0.color + ($0.deletedAt == nil ? ":active" : ":deleted") }
                 .joined(separator: "|") + "#\(selectedID?.uuidString ?? "none")"
-            guard signature != renderedHighlightSignature else { return }
+            guard signature != renderedHighlightSignature, let document = pdfView.document else { return }
 
-            if let document = pdfView.document {
-                for pageIndex in 0..<document.pageCount {
-                    guard let page = document.page(at: pageIndex) else { continue }
-                    for annotation in page.annotations where annotation.userName?.hasPrefix("PaperCompanion:") == true {
-                        page.removeAnnotation(annotation)
-                    }
-                }
+            let active = Dictionary(
+                highlights.filter { $0.deletedAt == nil }.map { ($0.id, $0) },
+                uniquingKeysWith: { first, _ in first }
+            )
 
-                for highlight in highlights where highlight.deletedAt == nil {
-                    for location in highlight.locations {
-                        guard let page = document.page(at: location.pageIndex) else { continue }
-                        for rect in location.lineRects {
-                            let bounds = NSRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
-                            let annotation = PDFAnnotation(bounds: bounds, forType: .highlight, withProperties: nil)
-                            annotation.color = highlight.id == selectedID
-                                ? NSColor.systemOrange.withAlphaComponent(0.62)
-                                : NSColor.systemYellow.withAlphaComponent(0.42)
-                            annotation.userName = "PaperCompanion:\(highlight.id.uuidString)"
-                            page.addAnnotation(annotation)
-                        }
-                    }
-                }
+            for (id, annotations) in renderedAnnotations where active[id] == nil {
+                for annotation in annotations { annotation.page?.removeAnnotation(annotation) }
+                renderedAnnotations[id] = nil
             }
+
+            var toDraw = Set(active.keys.filter { renderedAnnotations[$0] == nil || renderedColors[$0] != active[$0]?.color })
+            if renderedSelectedID != selectedID {
+                if let previous = renderedSelectedID, active[previous] != nil { toDraw.insert(previous) }
+                if let selectedID, active[selectedID] != nil { toDraw.insert(selectedID) }
+            }
+
+            for id in toDraw {
+                guard let highlight = active[id] else { continue }
+                for annotation in renderedAnnotations[id] ?? [] {
+                    annotation.page?.removeAnnotation(annotation)
+                }
+                var drawn: [PDFAnnotation] = []
+                for location in highlight.locations {
+                    guard let page = document.page(at: location.pageIndex) else { continue }
+                    for rect in location.lineRects {
+                        let bounds = NSRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
+                        let annotation = PDFAnnotation(bounds: bounds, forType: .highlight, withProperties: nil)
+                        annotation.color = (HighlightColor(rawValue: highlight.color) ?? .yellow).nsColor
+                            .withAlphaComponent(highlight.id == selectedID ? 0.65 : 0.42)
+                        annotation.userName = "PaperCompanion:\(highlight.id.uuidString)"
+                        page.addAnnotation(annotation)
+                        drawn.append(annotation)
+                    }
+                }
+                renderedAnnotations[id] = drawn
+            }
+            renderedColors = active.mapValues(\.color)
+            renderedSelectedID = selectedID
             renderedHighlightSignature = signature
         }
 
@@ -172,7 +206,7 @@ struct PDFReaderView: NSViewRepresentable {
                 .map { rect in
                     let bounds = NSRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
                     let annotation = PDFAnnotation(bounds: bounds, forType: .highlight, withProperties: nil)
-                    annotation.color = NSColor.systemOrange.withAlphaComponent(0.85)
+                    annotation.color = (HighlightColor(rawValue: highlight.color) ?? .yellow).nsColor.withAlphaComponent(0.35)
                     annotation.userName = "PaperCompanionFlash"
                     page.addAnnotation(annotation)
                     return annotation
@@ -181,6 +215,15 @@ struct PDFReaderView: NSViewRepresentable {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) {
                 for overlay in overlays { page.removeAnnotation(overlay) }
             }
+        }
+
+        func focusIfNeeded(requestID: UUID, in pdfView: PDFView) {
+            guard lastFocusRequestID != nil, lastFocusRequestID != requestID else {
+                lastFocusRequestID = requestID
+                return
+            }
+            lastFocusRequestID = requestID
+            pdfView.window?.makeFirstResponder(pdfView)
         }
 
         func searchIfNeeded(requestID: UUID, query: String, in pdfView: PDFView) {
@@ -210,13 +253,12 @@ struct PDFReaderView: NSViewRepresentable {
             state?.statusMessage = "Match \(searchIndex + 1) of \(searchResults.count)"
         }
 
+        // PDFKit posts these on the main thread; handling them synchronously
+        // keeps a highlight click ordered after the selection it clears.
         @objc private func selectionChanged() {
             guard let pdfView, let state else { return }
             let snapshot = makeSelectionSnapshot(pdfView.currentSelection, document: pdfView.document)
-            let allowAutoHighlight = !suppressAutoHighlight
-            Task { @MainActor in
-                state.selectionChanged(snapshot, allowAutoHighlight: allowAutoHighlight)
-            }
+            state.selectionChanged(snapshot, allowAutoHighlight: !suppressAutoHighlight)
         }
 
         @objc private func pageChanged() {
@@ -225,11 +267,7 @@ struct PDFReaderView: NSViewRepresentable {
                   let page = pdfView.currentPage,
                   let state else { return }
             let index = document.index(for: page)
-            let label = page.label ?? String(index + 1)
-            let text = page.string ?? ""
-            Task { @MainActor in
-                state.pageChanged(index: index, label: label, text: text)
-            }
+            state.pageChanged(index: index, label: page.label ?? String(index + 1), text: page.string ?? "")
         }
 
         private func makeSelectionSnapshot(_ selection: PDFSelection?, document: PDFDocument?) -> SelectionSnapshot? {
@@ -303,5 +341,85 @@ struct PDFReaderView: NSViewRepresentable {
                 text.substring(with: NSRange(location: suffixStart, length: suffixLength))
             )
         }
+    }
+}
+
+/// A PDFView that reports single clicks on Paper Companion highlight
+/// annotations. Selection behaviour is untouched: `super` runs first, and the
+/// click only counts when it did not become a drag.
+final class HighlightClickPDFView: PDFView {
+    var onHighlightClick: ((UUID) -> Void)?
+    /// ⌫ or ⌦ while this view has focus. Returns true when it consumed the key.
+    var onDeleteKey: (() -> Bool)?
+
+    override func keyDown(with event: NSEvent) {
+        let isDelete = event.keyCode == 51 || event.keyCode == 117
+        if isDelete, event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+           onDeleteKey?() == true {
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    var onHighlightDelete: ((UUID) -> Void)?
+    var onHighlightColor: ((UUID, String) -> Void)?
+    private var menuHighlightID: UUID?
+
+    private func highlightID(at event: NSEvent) -> UUID? {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let page = page(for: point, nearest: false) else { return nil }
+        let pagePoint = convert(point, to: page)
+        for annotation in page.annotations.reversed() where annotation.bounds.contains(pagePoint) {
+            if let name = annotation.userName, name.hasPrefix("PaperCompanion:"),
+               let id = UUID(uuidString: String(name.dropFirst("PaperCompanion:".count))) { return id }
+        }
+        return nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let id = highlightID(at: event)
+        super.mouseDown(with: event)
+        guard event.clickCount == 1, let id,
+              currentSelection?.string?.isEmpty ?? true else { return }
+        window?.makeFirstResponder(self)
+        onHighlightClick?(id)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let id = highlightID(at: event) else { return super.menu(for: event) }
+        clearSelection()
+        window?.makeFirstResponder(self)
+        onHighlightClick?(id)
+        menuHighlightID = id
+        let menu = NSMenu(title: "Highlight")
+        for color in HighlightColor.allCases {
+            let item = NSMenuItem(title: color.rawValue.capitalized, action: #selector(changeHighlightColor(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = color.rawValue
+            item.image = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { rect in
+                NSColor.white.setFill()
+                let circle = NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1))
+                circle.fill()
+                color.nsColor.withAlphaComponent(0.65).setFill()
+                circle.fill()
+                return true
+            }
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        let delete = NSMenuItem(title: "Delete Highlight and Comments", action: #selector(deleteMenuHighlight(_:)), keyEquivalent: "")
+        delete.target = self
+        menu.addItem(delete)
+        return menu
+    }
+
+    @objc private func changeHighlightColor(_ sender: NSMenuItem) {
+        guard let id = menuHighlightID, let color = sender.representedObject as? String else { return }
+        onHighlightColor?(id, color)
+    }
+
+    @objc private func deleteMenuHighlight(_ sender: NSMenuItem) {
+        guard let id = menuHighlightID else { return }
+        onHighlightDelete?(id)
     }
 }

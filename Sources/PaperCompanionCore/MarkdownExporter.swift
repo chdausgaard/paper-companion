@@ -79,6 +79,8 @@ public enum MarkdownExporter {
             "- PDF: `\(context.sourcePDFPath)`",
             "- Source fingerprint: `\(context.sourcePDFFingerprint)`",
             "- Text status: \(context.textStatus)",
+            "- Reading mode: \(context.readingMode.rawValue)",
+            "- Furthest page index reached: \(context.furthestPageIndex)",
             "- Updated: \(ISO8601DateFormatter().string(from: context.updatedAt))"
         ]
         if let highlightID = context.activeHighlightID {
