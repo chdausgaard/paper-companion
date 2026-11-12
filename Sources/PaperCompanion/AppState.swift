@@ -26,6 +26,19 @@ final class AppState: ObservableObject {
     /// Bumped when the PDF view should take keyboard focus, so ⌫ after a
     /// click in the list reaches the entry rather than a text field.
     @Published var pdfFocusRequestID = UUID()
+    /// Set when a newly made highlight should hand the keyboard to the comment
+    /// box. One composer takes it, through `takeCommentFocusRequest()`, so a
+    /// composer created later by the tab switch still sees it.
+    @Published private(set) var commentFocusRequestID: UUID?
+    private var commentFocusRequestedAt = Date.distantPast
+    private var commentFocusHighlightID: UUID?
+    private var takenCommentFocusRequestID: UUID?
+    /// Filters the annotations list; matching is `AnnotationSearch`.
+    @Published var annotationSearchQuery = ""
+    /// Set by Find in Comments (⇧⌘F); the sidebar search field takes it once.
+    @Published private(set) var annotationSearchFocusRequestID: UUID?
+    private var annotationSearchFocusRequestedAt = Date.distantPast
+    private var takenAnnotationSearchFocusRequestID: UUID?
     @Published var agentReplies: [UUID: String] = [:]
     @Published var currentPageIndex = 0
     @Published var currentPageLabel = "1"
@@ -147,6 +160,7 @@ final class AppState: ObservableObject {
             currentSelection = nil
             selectedHighlightID = nil
             selectedCommentID = nil
+            annotationSearchQuery = ""
             currentPageIndex = min(loaded.manifest.lastPageIndex, max(0, pdfDocument.pageCount - 1))
             currentPageLabel = pdfDocument.page(at: currentPageIndex)?.label ?? String(currentPageIndex + 1)
             currentPageText = pdfDocument.page(at: currentPageIndex)?.string ?? ""
@@ -196,7 +210,7 @@ final class AppState: ObservableObject {
                   let currentSelection = self.currentSelection,
                   self.selectionSignature(currentSelection) == signature else { return }
             self.lastAutoHighlightSignature = signature
-            _ = self.createHighlight(from: currentSelection, origin: "auto_highlight", registerUndo: true)
+            _ = self.createHighlight(from: currentSelection, origin: "auto_highlight", registerUndo: true, focusComposer: true)
         }
     }
 
@@ -237,14 +251,20 @@ final class AppState: ObservableObject {
             statusMessage = "Select text in the PDF first"
             return
         }
-        _ = createHighlight(from: snapshot, origin: "pdf_selection", registerUndo: true)
+        _ = createHighlight(from: snapshot, origin: "pdf_selection", registerUndo: true, focusComposer: true)
     }
 
+    /// `focusComposer` scrolls the new card into view and puts the cursor in
+    /// the comment box once the highlight exists. Only a highlight the user
+    /// just made asks for it: not one that already existed, and not the anchor
+    /// a saved comment creates (its search check would run before the comment
+    /// exists).
     @discardableResult
     private func createHighlight(
         from snapshot: SelectionSnapshot,
         origin: String,
-        registerUndo: Bool
+        registerUndo: Bool,
+        focusComposer: Bool = false
     ) -> HighlightRecord? {
         if let existing = activeHighlights.last(where: {
             $0.quote == snapshot.selectedText && $0.locations == snapshot.locations
@@ -267,6 +287,10 @@ final class AppState: ObservableObject {
             try writeSelectionContext(snapshot, activeHighlightID: highlight.id)
             if registerUndo { registerUndoForCreatedHighlight(highlight.id) }
             statusMessage = "Highlight saved · page \(highlight.pageLabel)"
+            if focusComposer {
+                revealInSidebar(highlight.id)
+                requestCommentFocus()
+            }
             return highlight
         } catch {
             highlights.removeAll { $0.id == highlight.id }
@@ -627,8 +651,76 @@ final class AppState: ObservableObject {
         guard let highlight = activeHighlights.first(where: { $0.id == id }) else { return }
         selectHighlight(highlight, navigate: false)
         inspectorTab = .annotations
+        revealInSidebar(id)
+    }
+
+    /// Scrolls an entry's card into view. A search that hides the card would
+    /// leave nothing to reveal, so it is cleared first.
+    private func revealInSidebar(_ id: UUID) {
+        if AnnotationSearch.isActive(annotationSearchQuery),
+           let entry = annotationEntries.first(where: { $0.id == id }),
+           !AnnotationSearch.matches(entry, query: annotationSearchQuery) {
+            annotationSearchQuery = ""
+        }
         sidebarRevealID = id
         sidebarRevealRequestID = UUID()
+    }
+
+    /// Requests are honoured for a short while only, so a composer created
+    /// much later (say, after returning from the library) does not grab the
+    /// keyboard for a highlight made long ago.
+    static let focusRequestLifetime: TimeInterval = 2
+
+    func requestCommentFocus() {
+        inspectorTab = .annotations
+        commentFocusRequestedAt = Date()
+        commentFocusHighlightID = selectedHighlightID
+        commentFocusRequestID = UUID()
+    }
+
+    /// Claims the pending request for one composer: returns its ID once, then
+    /// nil. The composer checks `isCommentFocusRequestCurrent` again at the
+    /// moment it actually takes focus.
+    func takeCommentFocusRequest() -> UUID? {
+        guard let id = commentFocusRequestID,
+              id != takenCommentFocusRequestID,
+              isCommentFocusRequestCurrent(id) else { return nil }
+        takenCommentFocusRequestID = id
+        return id
+    }
+
+    /// Still the latest request, still young, and the highlight it was made
+    /// for is still the selected one.
+    func isCommentFocusRequestCurrent(_ id: UUID) -> Bool {
+        id == commentFocusRequestID
+            && Date().timeIntervalSince(commentFocusRequestedAt) < Self.focusRequestLifetime
+            && selectedHighlightID == commentFocusHighlightID
+    }
+
+    /// Find in Comments (⇧⌘F).
+    func findInComments() {
+        guard document != nil else { return }
+        inspectorTab = .annotations
+        annotationSearchFocusRequestedAt = Date()
+        annotationSearchFocusRequestID = UUID()
+    }
+
+    func takeAnnotationSearchFocusRequest() -> UUID? {
+        guard let id = annotationSearchFocusRequestID,
+              id != takenAnnotationSearchFocusRequestID,
+              isAnnotationSearchFocusRequestCurrent(id) else { return nil }
+        takenAnnotationSearchFocusRequestID = id
+        return id
+    }
+
+    func isAnnotationSearchFocusRequestCurrent(_ id: UUID) -> Bool {
+        id == annotationSearchFocusRequestID
+            && Date().timeIntervalSince(annotationSearchFocusRequestedAt) < Self.focusRequestLifetime
+    }
+
+    /// Esc in an empty comment box hands the keyboard back to the PDF.
+    func requestPDFFocus() {
+        pdfFocusRequestID = UUID()
     }
 
     func setReadingMode(_ mode: ReadingMode) {

@@ -442,6 +442,99 @@ public struct AnnotationEntry: Identifiable, Equatable, Sendable {
         }
         return entries.sorted { $0.position < $1.position }
     }
+
+    /// What the entry's card shows: its comments, or the quote when the entry
+    /// is a highlight with no comment. Search matches only this, so a card is
+    /// never found by text the reader cannot see on it.
+    public var displayedTexts: [String] {
+        if !comments.isEmpty { return comments.map(\.verbatim) }
+        return highlight.map { [$0.quote.normalizedForSearch] } ?? []
+    }
+
+    /// Entries grouped under their page, keeping the order they arrive in.
+    /// Grouping is by page index, so a page appears once even if the input is
+    /// not sorted.
+    public static func groupedByPage(_ entries: [AnnotationEntry]) -> [AnnotationPageGroup] {
+        var groups: [AnnotationPageGroup] = []
+        var indexByPage: [Int: Int] = [:]
+        for entry in entries {
+            if let index = indexByPage[entry.pageIndex] {
+                groups[index].entries.append(entry)
+            } else {
+                indexByPage[entry.pageIndex] = groups.count
+                groups.append(AnnotationPageGroup(pageIndex: entry.pageIndex, pageLabel: entry.pageLabel, entries: [entry]))
+            }
+        }
+        return groups
+    }
+}
+
+/// The cards of one page in the annotations list, shown under a "Page N" header.
+public struct AnnotationPageGroup: Identifiable, Equatable, Sendable {
+    public var pageIndex: Int
+    public var pageLabel: String
+    public var entries: [AnnotationEntry]
+
+    public var id: Int { pageIndex }
+
+    public init(pageIndex: Int, pageLabel: String, entries: [AnnotationEntry]) {
+        self.pageIndex = pageIndex
+        self.pageLabel = pageLabel
+        self.entries = entries
+    }
+}
+
+/// Searching the annotations list. Case- and diacritic-insensitive; every
+/// whitespace-separated term must occur somewhere in what the card shows.
+public enum AnnotationSearch {
+    private static let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive, .widthInsensitive]
+
+    public static func terms(_ query: String) -> [String] {
+        query.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+    }
+
+    public static func isActive(_ query: String) -> Bool {
+        !terms(query).isEmpty
+    }
+
+    public static func matches(_ entry: AnnotationEntry, query: String) -> Bool {
+        let terms = terms(query)
+        guard !terms.isEmpty else { return true }
+        let texts = entry.displayedTexts
+        return terms.allSatisfy { term in
+            texts.contains { $0.range(of: term, options: options) != nil }
+        }
+    }
+
+    /// The entries a query leaves visible; all of them for an empty query.
+    public static func filter(_ entries: [AnnotationEntry], query: String) -> [AnnotationEntry] {
+        guard isActive(query) else { return entries }
+        return entries.filter { matches($0, query: query) }
+    }
+
+    /// Every occurrence of any term in `text`, sorted and with overlaps
+    /// merged, for emphasizing matches in the card.
+    public static func matchRanges(of query: String, in text: String) -> [Range<String.Index>] {
+        var found: [Range<String.Index>] = []
+        for term in terms(query) {
+            var searchStart = text.startIndex
+            while searchStart < text.endIndex,
+                  let range = text.range(of: term, options: options, range: searchStart..<text.endIndex) {
+                found.append(range)
+                searchStart = range.upperBound
+            }
+        }
+        found.sort { $0.lowerBound < $1.lowerBound }
+        var merged: [Range<String.Index>] = []
+        for range in found {
+            if let last = merged.last, range.lowerBound <= last.upperBound {
+                merged[merged.count - 1] = last.lowerBound..<max(last.upperBound, range.upperBound)
+            } else {
+                merged.append(range)
+            }
+        }
+        return merged
+    }
 }
 
 extension String {

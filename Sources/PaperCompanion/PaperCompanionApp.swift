@@ -29,6 +29,12 @@ struct PaperCompanionApp: App {
                     .keyboardShortcut("z", modifiers: [.command, .shift])
             }
 
+            CommandGroup(after: .textEditing) {
+                Button("Find in Comments", action: state.findInComments)
+                    .keyboardShortcut("f", modifiers: [.command, .shift])
+                    .disabled(state.document == nil)
+            }
+
             CommandGroup(after: .newItem) {
                 Button("Open PDF…", action: state.openPDF)
                     .keyboardShortcut("o", modifiers: .command)

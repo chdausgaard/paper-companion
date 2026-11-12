@@ -224,6 +224,10 @@ struct PDFReaderView: NSViewRepresentable {
             }
             lastFocusRequestID = requestID
             pdfView.window?.makeFirstResponder(pdfView)
+            // Esc in the Reading Notes window's comment box asks for this
+            // while that window is key; the keyboard only reaches the PDF if
+            // its window becomes key too.
+            if let window = pdfView.window, !window.isKeyWindow { window.makeKey() }
         }
 
         func searchIfNeeded(requestID: UUID, query: String, in pdfView: PDFView) {
