@@ -20,13 +20,20 @@ struct PDFReaderView: NSViewRepresentable {
         }
         pdfView.onHighlightDelete = { [weak state] id in state?.deleteHighlight(id) }
         pdfView.onHighlightColor = { [weak state] id, color in state?.setHighlightColor(id, color: color) }
+        pdfView.onAnnotationHoverChange = { [weak coordinator = context.coordinator] id in
+            coordinator?.pageHoverChanged(id)
+        }
         pdfView.autoScales = true
         pdfView.displayMode = .singlePageContinuous
         pdfView.displayDirection = .vertical
         pdfView.displaysPageBreaks = true
         pdfView.pageShadowsEnabled = true
-        pdfView.backgroundColor = .windowBackgroundColor
+        // The system's under-page "desk" behind the pages (PDFView's scroll
+        // view draws it as the matching material), so the white pages read
+        // as sheets lifted off it rather than as part of the window.
+        pdfView.backgroundColor = .underPageBackgroundColor
         context.coordinator.connect(to: pdfView)
+        state.annotationHover.cardHoverObserver = context.coordinator
         return pdfView
     }
 
@@ -57,13 +64,16 @@ struct PDFReaderView: NSViewRepresentable {
     }
 
     @MainActor
-    final class Coordinator: NSObject {
+    final class Coordinator: NSObject, AnnotationHoverObserver {
         private weak var pdfView: PDFView?
         private weak var state: AppState?
         private var renderedHighlightSignature = ""
         private var renderedAnnotations: [UUID: [PDFAnnotation]] = [:]
         private var renderedSelectedID: UUID?
         private var renderedColors: [UUID: String] = [:]
+        /// The highlight drawn brighter because the pointer is on it, on the
+        /// page or on its card.
+        private var emphasizedID: UUID?
         private var lastNavigationRequestID: UUID?
         private var lastSearchRequestID: UUID?
         private var lastFocusRequestID: UUID?
@@ -101,9 +111,70 @@ struct PDFReaderView: NSViewRepresentable {
             renderedAnnotations = [:]
             renderedSelectedID = nil
             renderedColors = [:]
+            emphasizedID = nil
+            state?.annotationHover.reset()
+            reconcileHover()
             searchResults = []
             searchIndex = 0
             lastSearchQuery = ""
+        }
+
+        /// Highlight fill in three clear steps: brighter with the pointer on
+        /// it, stronger when selected, strongest when both. One place, so
+        /// every path draws the same states.
+        static func highlightFill(_ color: String, selected: Bool, hovered: Bool) -> NSColor {
+            let alpha: CGFloat
+            switch (selected, hovered) {
+            case (false, false): alpha = 0.42
+            case (false, true): alpha = 0.57
+            case (true, false): alpha = 0.72
+            case (true, true): alpha = 0.88
+            }
+            return (HighlightColor(rawValue: color) ?? .yellow).nsColor.withAlphaComponent(alpha)
+        }
+
+        // MARK: Hover
+
+        /// The annotation under the pointer on the page changed.
+        func pageHoverChanged(_ id: UUID?) {
+            state?.annotationHover.setPageHovered(id)
+            updateEmphasis()
+        }
+
+        func cardHoverDidChange() {
+            updateEmphasis()
+        }
+
+        /// Brings every place hover lives into agreement after the drawn
+        /// annotations changed without a pointer event (a highlight deleted
+        /// or restored under a still pointer, a new document): the view
+        /// hit-tests again where the pointer last was and sets the cursor
+        /// PDFKit would choose there, the shared hover object takes the
+        /// result, and the page emphasis follows it and the card hover.
+        private func reconcileHover() {
+            guard let hover = state?.annotationHover else { return }
+            let pageID = (pdfView as? HighlightClickPDFView)?.refreshHover()
+            if hover.pageHoveredID != pageID { hover.setPageHovered(pageID) }
+            updateEmphasis()
+        }
+
+        /// Restyles only the highlight that gained the pointer and the one
+        /// that lost it, changing their color in place: no annotation is added
+        /// or removed, and no other highlight is touched, so a paper with a
+        /// hundred highlights does not stutter as the pointer moves.
+        private func updateEmphasis() {
+            guard let hover = state?.annotationHover else { return }
+            // The page wins: the card side lags by its delay.
+            let wanted = hover.pageHoveredID ?? hover.cardHoveredID
+            let target = wanted.flatMap { renderedAnnotations[$0] == nil ? nil : $0 }
+            guard target != emphasizedID else { return }
+            let previous = emphasizedID
+            emphasizedID = target
+            for id in [previous, target].compactMap({ $0 }) {
+                guard let color = renderedColors[id] else { continue }
+                let fill = Self.highlightFill(color, selected: id == renderedSelectedID, hovered: id == emphasizedID)
+                for annotation in renderedAnnotations[id] ?? [] { annotation.color = fill }
+            }
         }
 
         /// Adds and removes only what changed. Rebuilding every annotation on
@@ -127,6 +198,11 @@ struct PDFReaderView: NSViewRepresentable {
             for (id, annotations) in renderedAnnotations where active[id] == nil {
                 for annotation in annotations { annotation.page?.removeAnnotation(annotation) }
                 renderedAnnotations[id] = nil
+                // A deleted highlight under the pointer: forget the hover, or
+                // its card would come back lit after an undo.
+                // Its annotations are gone; `reconcileHover` below settles
+                // what the pointer is on now.
+                if emphasizedID == id { emphasizedID = nil }
             }
 
             var toDraw = Set(active.keys.filter { renderedAnnotations[$0] == nil || renderedColors[$0] != active[$0]?.color })
@@ -146,9 +222,12 @@ struct PDFReaderView: NSViewRepresentable {
                     for rect in location.lineRects {
                         let bounds = NSRect(x: rect.x, y: rect.y, width: rect.width, height: rect.height)
                         let annotation = PDFAnnotation(bounds: bounds, forType: .highlight, withProperties: nil)
-                        annotation.color = (HighlightColor(rawValue: highlight.color) ?? .yellow).nsColor
-                            .withAlphaComponent(highlight.id == selectedID ? 0.65 : 0.42)
-                        annotation.userName = "PaperCompanion:\(highlight.id.uuidString)"
+                        annotation.color = Self.highlightFill(
+                            highlight.color,
+                            selected: highlight.id == selectedID,
+                            hovered: highlight.id == emphasizedID
+                        )
+                        annotation.userName = HighlightClickPDFView.annotationNamePrefix + highlight.id.uuidString
                         page.addAnnotation(annotation)
                         drawn.append(annotation)
                     }
@@ -158,6 +237,7 @@ struct PDFReaderView: NSViewRepresentable {
             renderedColors = active.mapValues(\.color)
             renderedSelectedID = selectedID
             renderedHighlightSignature = signature
+            reconcileHover()
         }
 
         func navigateIfNeeded(
@@ -369,28 +449,218 @@ final class HighlightClickPDFView: PDFView {
     var onHighlightColor: ((UUID, String) -> Void)?
     private var menuHighlightID: UUID?
 
-    private func highlightID(at event: NSEvent) -> UUID? {
-        let point = convert(event.locationInWindow, from: nil)
+    // MARK: Hit testing
+
+    static let annotationNamePrefix = "PaperCompanion:"
+
+    /// The record ID a Paper Companion annotation was drawn for, from the
+    /// `userName` it was tagged with. Nil for the PDF's own annotations and
+    /// for the arrival flash.
+    static func annotationID(of annotation: PDFAnnotation) -> UUID? {
+        guard let name = annotation.userName, name.hasPrefix(annotationNamePrefix) else { return nil }
+        return UUID(uuidString: String(name.dropFirst(annotationNamePrefix.count)))
+    }
+
+    /// The Paper Companion annotation under a point in this view's
+    /// coordinates: the topmost one whose bounds contain it. Clicks, the
+    /// context menu and hover all ask this, so they always agree.
+    func annotationID(at point: NSPoint) -> UUID? {
         guard let page = page(for: point, nearest: false) else { return nil }
         let pagePoint = convert(point, to: page)
         for annotation in page.annotations.reversed() where annotation.bounds.contains(pagePoint) {
-            if let name = annotation.userName, name.hasPrefix("PaperCompanion:"),
-               let id = UUID(uuidString: String(name.dropFirst("PaperCompanion:".count))) { return id }
+            if let id = Self.annotationID(of: annotation) { return id }
         }
         return nil
     }
 
+    private func annotationID(at event: NSEvent) -> UUID? {
+        annotationID(at: convert(event.locationInWindow, from: nil))
+    }
+
+    // MARK: Hover
+
+    /// Called only when the annotation under the pointer changes.
+    var onAnnotationHoverChange: ((UUID?) -> Void)?
+    private(set) var hoveredAnnotationID: UUID?
+    private var hoverTrackingArea: NSTrackingArea?
+    private weak var lastMovedEvent: NSEvent?
+    /// Where the pointer last was, from the events this view received; nil
+    /// once it left. Scrolling hit-tests here again.
+    private var pointerLocationInWindow: NSPoint?
+    private weak var observedClipView: NSClipView?
+
+    /// PDFView keeps a tracking area of its own (no mouse-moved option); this
+    /// one adds mouse-moved and entered/exited for hover. Same activity rule
+    /// as PDFView's: the key window only, where the cursor is ours to set.
+    private func installHoverTrackingArea() {
+        if let hoverTrackingArea, trackingAreas.contains(hoverTrackingArea) { return }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        installHoverTrackingArea()
+        observeScrolling()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        installHoverTrackingArea()
+    }
+
+    /// Scrolling moves the pages under a still pointer, and scroll-wheel
+    /// events go to PDFView's inner scroll view, not to this view. Its clip
+    /// view reports every scroll, from the wheel, the keyboard or navigation.
+    private func observeScrolling() {
+        guard let clip = subviews.lazy.compactMap({ $0 as? NSScrollView }).first?.contentView,
+              clip !== observedClipView else { return }
+        if let observedClipView {
+            NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: observedClipView)
+        }
+        clip.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(clipViewScrolled(_:)),
+            name: NSView.boundsDidChangeNotification, object: clip
+        )
+        observedClipView = clip
+    }
+
+    @objc private func clipViewScrolled(_ notification: Notification) {
+        guard let location = pointerLocationInWindow else { return }
+        pointerMoved(to: location)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        // The window can hand one event to this view twice: through the
+        // hover tracking area and through PDFView's own route while it is
+        // first responder. PDFView handled it the first time.
+        guard event !== lastMovedEvent else { return }
+        lastMovedEvent = event
+        pointerLocationInWindow = event.locationInWindow
+        updateHover(at: convert(event.locationInWindow, from: nil))
+        super.mouseMoved(with: event)
+        if hoveredAnnotationID != nil { setHoverCursor() }
+    }
+
+    /// The pointer is at `location` (window coordinates) without a
+    /// mouse-moved event having said so: after a scroll, or after a drag that
+    /// PDFKit tracked itself. Reports a change of hover and sets the cursor.
+    private func pointerMoved(to location: NSPoint) {
+        pointerLocationInWindow = location
+        let before = hoveredAnnotationID
+        updateHover(at: convert(location, from: nil))
+        if hoveredAnnotationID != before { applyCursor() }
+    }
+
+    /// The cursor for where the pointer last was: the pointing hand over one
+    /// of our annotations, otherwise what PDFKit chooses for that spot. Only
+    /// while this window has the keyboard (or none has, as when the app is in
+    /// the background, where the system ignores it anyway).
+    private func applyCursor() {
+        guard let location = pointerLocationInWindow, let window,
+              window.isKeyWindow || NSApp.keyWindow == nil else { return }
+        if hoveredAnnotationID != nil {
+            setHoverCursor()
+        } else {
+            super.setCursorFor(areaOfInterest(for: convert(location, from: nil)))
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        guard event.trackingArea === hoverTrackingArea, hoverTrackingArea != nil else {
+            return super.mouseEntered(with: event)
+        }
+        pointerLocationInWindow = event.locationInWindow
+        updateHover(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard event.trackingArea === hoverTrackingArea, hoverTrackingArea != nil else {
+            return super.mouseExited(with: event)
+        }
+        pointerLocationInWindow = nil
+        updateHover(at: nil)
+    }
+
+    /// PDFView sets the I-beam, arrow or link cursor here as the pointer
+    /// moves. Over one of our annotations it is the pointing hand, as for a
+    /// link, because a click there selects it. Not while a button is down:
+    /// a drag that started on a highlight is selecting text.
+    override func setCursorFor(_ area: PDFAreaOfInterest) {
+        if hoveredAnnotationID != nil, NSEvent.pressedMouseButtons == 0 {
+            NSCursor.pointingHand.set()
+        } else {
+            super.setCursorFor(area)
+        }
+    }
+
+    private func setHoverCursor() {
+        guard NSEvent.pressedMouseButtons == 0 else { return }
+        NSCursor.pointingHand.set()
+    }
+
+    /// Hit-tests on every move but reports only a change.
+    private func updateHover(at point: NSPoint?) {
+        let id = point.flatMap { annotationID(at: $0) }
+        guard id != hoveredAnnotationID else { return }
+        hoveredAnnotationID = id
+        onAnnotationHoverChange?(id)
+    }
+
+    /// Hit-tests again where the pointer last was, after the annotations
+    /// under it changed without a pointer event. Does not report: the
+    /// coordinator calls this inside its own update and settles the rest.
+    /// Sets the cursor when the answer changed, so a hand does not linger
+    /// over a highlight that was deleted.
+    @discardableResult
+    func refreshHover() -> UUID? {
+        let id = pointerLocationInWindow.flatMap { annotationID(at: convert($0, from: nil)) }
+        guard id != hoveredAnnotationID else { return id }
+        hoveredAnnotationID = id
+        applyCursor()
+        return id
+    }
+
+    // MARK: Clicks
+
     override func mouseDown(with event: NSEvent) {
-        let id = highlightID(at: event)
+        let id = annotationID(at: event)
         super.mouseDown(with: event)
+        // PDFKit tracks a drag inside `super` and takes its dragged and up
+        // events, so no mouse-moved follows a selection drag: the pointer may
+        // now be far from where the button went down.
+        pointerMoved(to: pointerLocationAfterTracking(startedWith: event))
         guard event.clickCount == 1, let id,
               currentSelection?.string?.isEmpty ?? true else { return }
         window?.makeFirstResponder(self)
         onHighlightClick?(id)
     }
 
+    /// Where the pointer is once PDFKit's tracking of a press has returned:
+    /// the last event it took from the queue, if that was this press's
+    /// drag or release in this window.
+    private func pointerLocationAfterTracking(startedWith event: NSEvent) -> NSPoint {
+        if let last = NSApp.currentEvent, last.window === window,
+           [.leftMouseDragged, .leftMouseUp].contains(last.type) {
+            return last.locationInWindow
+        }
+        return event.locationInWindow
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        pointerMoved(to: event.locationInWindow)
+    }
+
     override func menu(for event: NSEvent) -> NSMenu? {
-        guard let id = highlightID(at: event) else { return super.menu(for: event) }
+        guard let id = annotationID(at: event) else { return super.menu(for: event) }
         clearSelection()
         window?.makeFirstResponder(self)
         onHighlightClick?(id)

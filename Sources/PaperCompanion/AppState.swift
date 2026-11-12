@@ -60,6 +60,9 @@ final class AppState: ObservableObject {
     }
 
     var undoManager = UndoManager()
+    /// Pointer hover linking the PDF page and the cards. Deliberately not
+    /// `@Published`: see `AnnotationHover`.
+    let annotationHover = AnnotationHover()
 
     enum InspectorTab: Hashable {
         case annotations, notes, agent

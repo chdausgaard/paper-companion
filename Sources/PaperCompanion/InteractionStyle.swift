@@ -1,8 +1,8 @@
 import AppKit
 import SwiftUI
 
-/// Shared look and motion for things the pointer acts on: annotation cards
-/// now, PDF highlights and region markers later. The look stays native: system
+/// Shared look and motion for things the pointer acts on: annotation cards,
+/// PDF highlights, and region markers later. The look stays native: system
 /// colors only, and depth from a fill, a hairline and a soft shadow rather than
 /// from a theme.
 enum InteractionStyle {
@@ -63,6 +63,117 @@ struct InteractiveSurfaceBackground: View {
         case .pressed: return 0.17
         }
     }
+}
+
+/// Which annotation the pointer is on, shared by the PDF page and the cards so
+/// each can light up the other. Annotations are keyed by their highlight
+/// record's ID, so any kind drawn on the page under that ID takes part.
+///
+/// Not a published property of `AppState`: a change there re-renders the whole
+/// window and rebuilds the sorted list, and hover changes many times a second.
+/// Here each card observes only its own `Flag`, and the PDF side is told
+/// through `cardHoverObserver`, so a change reaches only the two annotations
+/// that gained and lost hover.
+@MainActor
+final class AnnotationHover {
+    /// One card's share of the hover state.
+    @MainActor
+    final class Flag: ObservableObject {
+        /// The pointer is on this annotation on the PDF page.
+        @Published fileprivate(set) var isHoveredOnPage = false
+    }
+
+    /// How long the pointer must rest on a card before its highlight lights
+    /// up on the page. Scrolling the list passes cards under a still pointer;
+    /// without the wait the page would strobe.
+    static var cardHoverDelay: TimeInterval = 0.12
+
+    /// The annotation under the pointer on the PDF page.
+    private(set) var pageHoveredID: UUID?
+    /// The annotation whose card the pointer rests on, once the delay passed.
+    private(set) var cardHoveredID: UUID?
+    /// Told when `cardHoveredID` changes: the PDF reader's coordinator.
+    weak var cardHoverObserver: AnnotationHoverObserver?
+
+    private var flags: [UUID: Flag] = [:]
+    /// The annotation whose flag is published as hovered.
+    private var publishedPageID: UUID?
+    private var flagSyncScheduled = false
+    private var pendingCardID: UUID?
+    private var cardHoverTask: Task<Void, Never>?
+
+    /// The flag for one annotation's card. Flags are never dropped, so a card
+    /// that is rebuilt finds the same one.
+    func flag(for id: UUID) -> Flag {
+        if let flag = flags[id] { return flag }
+        let flag = Flag()
+        flags[id] = flag
+        return flag
+    }
+
+    /// The annotation under the pointer on the page. The cards' flags follow
+    /// on the next turn of the run loop: this is also called from inside
+    /// SwiftUI updates (a redraw of the page, a scroll during navigation),
+    /// where publishing is not allowed. The flags then publish whatever is
+    /// current at that moment, so a later change can never be undone by an
+    /// earlier one.
+    func setPageHovered(_ id: UUID?) {
+        pageHoveredID = id
+        guard !flagSyncScheduled else { return }
+        flagSyncScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.flagSyncScheduled = false
+            self.publishPageHover()
+        }
+    }
+
+    private func publishPageHover() {
+        guard publishedPageID != pageHoveredID else { return }
+        if let old = publishedPageID { flags[old]?.isHoveredOnPage = false }
+        publishedPageID = pageHoveredID
+        if let id = pageHoveredID { flag(for: id).isHoveredOnPage = true }
+    }
+
+    /// A card gained or lost the pointer. Applied after `cardHoverDelay`, and
+    /// only the last change within that time counts.
+    func cardHoverChanged(_ id: UUID, isHovering: Bool) {
+        if isHovering {
+            pendingCardID = id
+        } else if pendingCardID == id {
+            pendingCardID = nil
+        } else {
+            // Leaving a card after the next one was entered: nothing to undo.
+            return
+        }
+        cardHoverTask?.cancel()
+        let delay = Self.cardHoverDelay
+        cardHoverTask = Task { @MainActor [weak self] in
+            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            guard !Task.isCancelled, let self else { return }
+            self.commitCardHover()
+        }
+    }
+
+    /// A new document: nothing is hovered until the pointer is found on it
+    /// again. Synchronous, so it cannot land after a newer hover.
+    func reset() {
+        setPageHovered(nil)
+        cardHoverTask?.cancel()
+        pendingCardID = nil
+        cardHoveredID = nil
+    }
+
+    private func commitCardHover() {
+        guard cardHoveredID != pendingCardID else { return }
+        cardHoveredID = pendingCardID
+        cardHoverObserver?.cardHoverDidChange()
+    }
+}
+
+@MainActor
+protocol AnnotationHoverObserver: AnyObject {
+    func cardHoverDidChange()
 }
 
 /// Small borderless icon buttons (edit, delete) with a hover and a pressed

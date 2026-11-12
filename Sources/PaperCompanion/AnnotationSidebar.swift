@@ -286,10 +286,18 @@ struct AnnotationCard: View {
         .padding(.trailing, 6)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(InteractiveSurfaceBackground(pointer: pointer, isSelected: expanded))
+        .background(LinkedSurfaceBackground(
+            flag: state.annotationHover.flag(for: entry.id),
+            pointer: pointer,
+            isSelected: expanded
+        ))
         .contentShape(RoundedRectangle(cornerRadius: InteractionStyle.cornerRadius, style: .continuous))
         .animation(InteractionStyle.hover, value: pointer)
-        .onHover { hovering = $0 }
+        .onHover { inside in
+            hovering = inside
+            reportHover(inside)
+        }
+        .onDisappear { reportHover(false) }
         // One gesture for the pressed look and the click. A tap gesture next
         // to a zero-distance drag never fires on macOS (the click test caught
         // it), so the drag acts as the click when the pointer barely moved.
@@ -309,6 +317,13 @@ struct AnnotationCard: View {
         .help(expanded ? "" : "Click to show the full text and go to the passage")
         .accessibilityAddTraits(expanded ? [.isSelected] : [.isButton])
         .padding(.horizontal, 8)
+    }
+
+    /// Lights the card's highlight on the page. Page-only comments have
+    /// nothing drawn there.
+    private func reportHover(_ inside: Bool) {
+        guard entry.highlight != nil else { return }
+        state.annotationHover.cardHoverChanged(entry.id, isHovering: inside)
     }
 
     private func clicked() {
@@ -458,6 +473,25 @@ struct AnnotationCard: View {
             attributed[target][AttributeScopes.SwiftUIAttributes.ForegroundColorAttribute.self] = .black
         }
         return attributed
+    }
+}
+
+/// The card's background, also drawn hovered while the pointer is on the
+/// card's highlight on the PDF page. Its own view observing only this card's
+/// flag, so a hover on the page redraws this background and nothing else of
+/// the list. The edit and delete controls stay hidden then: the pointer is
+/// not here to use them.
+struct LinkedSurfaceBackground: View {
+    @ObservedObject var flag: AnnotationHover.Flag
+    var pointer: PointerState
+    var isSelected: Bool
+
+    var body: some View {
+        InteractiveSurfaceBackground(
+            pointer: pointer == .idle && flag.isHoveredOnPage ? .hovered : pointer,
+            isSelected: isSelected
+        )
+        .animation(InteractionStyle.hover, value: flag.isHoveredOnPage)
     }
 }
 

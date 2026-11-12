@@ -92,15 +92,6 @@ final class SidebarSnapshotTests: XCTestCase {
                     marginNoted: marginNoted, pageComment: pageComment)
     }
 
-    private func outputDirectory() throws -> URL {
-        guard let path = ProcessInfo.processInfo.environment["PAPER_COMPANION_SNAPSHOT_DIR"], !path.isEmpty else {
-            throw XCTSkip("Set PAPER_COMPANION_SNAPSHOT_DIR to render sidebar snapshots")
-        }
-        let url = URL(fileURLWithPath: path, isDirectory: true)
-        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        return url
-    }
-
     /// The sidebar as the window shows it: the inspector with its tabs.
     @MainActor
     private func sidebar(_ state: AppState, overrides: [UUID: PointerState] = [:]) -> some View {
@@ -113,7 +104,7 @@ final class SidebarSnapshotTests: XCTestCase {
 
     @MainActor
     private func render<V: View>(_ name: String, _ make: () -> (AppState, V), prepare: (AppState) -> Void = { _ in }) throws {
-        let directory = try outputDirectory()
+        let directory = try SnapshotOutput.directory()
         for dark in [false, true] {
             let (state, view) = make()
             let appearance = NSAppearance(named: dark ? .darkAqua : .aqua)!
@@ -133,16 +124,9 @@ final class SidebarSnapshotTests: XCTestCase {
             RunLoop.main.run(until: Date().addingTimeInterval(0.5))
             host.layoutSubtreeIfNeeded()
 
-            guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
-                return XCTFail("No bitmap for \(name)")
-            }
-            appearance.performAsCurrentDrawingAppearance {
-                host.cacheDisplay(in: host.bounds, to: rep)
-            }
-            let data = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
             let url = directory.appendingPathComponent("\(name)-\(dark ? "dark" : "light").png")
-            try data.write(to: url)
-            XCTAssertGreaterThan(data.count, 10_000, "\(url.lastPathComponent) looks blank")
+            let bytes = try SnapshotOutput.writePNG(of: host, appearance: appearance, to: url)
+            XCTAssertGreaterThan(bytes, 10_000, "\(url.lastPathComponent) looks blank")
             window.contentView = nil
             window.close()
         }

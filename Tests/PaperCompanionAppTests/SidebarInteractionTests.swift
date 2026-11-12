@@ -39,15 +39,6 @@ final class SidebarInteractionTests: XCTestCase {
         return state
     }
 
-    @MainActor
-    private func spin(_ seconds: TimeInterval = 0.3) {
-        RunLoop.main.run(until: Date().addingTimeInterval(seconds))
-    }
-
-    private func descendants<T: NSView>(of view: NSView, as type: T.Type) -> [T] {
-        view.subviews.flatMap { ([$0 as? T].compactMap { $0 }) + descendants(of: $0, as: type) }
-    }
-
     private func escapeKey(in window: NSWindow) throws -> NSEvent {
         try XCTUnwrap(NSEvent.keyEvent(
             with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0,
@@ -457,44 +448,6 @@ final class SidebarInteractionTests: XCTestCase {
 
     // MARK: Real clicks (item 1)
 
-    /// Runs `body` with the given view classes accepting the first click. The
-    /// test process is never the active app, so AppKit treats each click as
-    /// one that would activate the app and hands it on only to a view that
-    /// accepts first mouse, which SwiftUI's internal views decline. In the app
-    /// the user clicks a window of the active app and that question is never
-    /// asked. Hit-testing and dispatch are otherwise AppKit's own.
-    @MainActor
-    private func withFirstMouseAccepted(by classes: [AnyClass], _ body: () throws -> Void) rethrows {
-        let selector = #selector(NSView.acceptsFirstMouse(for:))
-        let accept: @convention(block) (NSView, NSEvent?) -> Bool = { _, _ in true }
-        let acceptIMP = imp_implementationWithBlock(accept)
-        var restore: [(AnyClass, IMP, UnsafePointer<CChar>?)] = []
-        for cls in classes {
-            guard let method = class_getInstanceMethod(cls, selector) else { continue }
-            let encoding = method_getTypeEncoding(method)
-            restore.append((cls, method_getImplementation(method), encoding))
-            class_replaceMethod(cls, selector, acceptIMP, encoding)
-        }
-        // A class that only inherited the method keeps the inherited behaviour.
-        defer { for (cls, imp, encoding) in restore.reversed() { class_replaceMethod(cls, selector, imp, encoding) } }
-        try body()
-    }
-
-    /// A real click: mouse-down and mouse-up NSEvents through the window,
-    /// which hit-tests and dispatches them as it does the user's clicks.
-    @MainActor
-    private func click(atWindowPoint location: NSPoint, in window: NSWindow, clickCount: Int = 1, settle: TimeInterval = 0.4) {
-        for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
-            let event = NSEvent.mouseEvent(
-                with: type, location: location, modifierFlags: [],
-                timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
-                context: nil, eventNumber: 0, clickCount: clickCount, pressure: type == .leftMouseDown ? 1 : 0)!
-            window.sendEvent(event)
-            spin(0.02)
-        }
-        spin(settle)
-    }
-
     /// Clicks anywhere on a collapsed card select and expand it: on the
     /// comment text (both lines), on the quote of a highlight with no comment,
     /// on the marker, and on the strip above the text where the old header
@@ -525,16 +478,8 @@ final class SidebarInteractionTests: XCTestCase {
 
         let host = NSHostingView(rootView: AnnotationsView().environmentObject(state).frame(width: 420, height: 760))
         host.frame = NSRect(x: 0, y: 0, width: 420, height: 760)
-        let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
-        window.isReleasedWhenClosed = false
-        window.contentView = host
-        // Ordered in, because an unordered window drops mouse events, but far
-        // off every screen, so nothing appears.
-        window.setFrameOrigin(NSPoint(x: -20_000, y: -20_000))
-        window.orderFrontRegardless()
-        defer { window.orderOut(nil); window.contentView = nil; window.close() }
-        XCTAssertLessThan(window.frame.maxX, 0, "the test window stays off screen")
-        host.layoutSubtreeIfNeeded()
+        let window = offscreenWindow(for: host)
+        defer { closeOffscreenWindow(window) }
         spin()
 
         // Where things are, read from the real view tree: each Text draws in a
