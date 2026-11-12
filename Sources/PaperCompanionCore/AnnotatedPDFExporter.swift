@@ -70,7 +70,9 @@ public enum AnnotatedPDFExporter {
             let note = noteText(for: linked, replies: replies)
             for location in highlight.locations {
                 guard let page = document.page(at: location.pageIndex),
-                      let annotation = highlightAnnotation(for: location) else { continue }
+                      let annotation = highlight.isRegion
+                        ? regionAnnotation(for: location)
+                        : highlightAnnotation(for: location) else { continue }
                 annotation.color = (HighlightColor(rawValue: highlight.color) ?? .yellow).nsColor
                 annotation.contents = note
                 annotation.userName = author
@@ -129,6 +131,17 @@ public enum AnnotatedPDFExporter {
                 NSPoint(x: x0, y: y0), NSPoint(x: x1, y: y0)
             ].map { NSValue(point: $0) }
         }
+        return annotation
+    }
+
+    /// A region is a square outline over the box. No fill: other viewers draw
+    /// it opaque, which would hide the figure the comment is about.
+    private static func regionAnnotation(for location: HighlightLocation) -> PDFAnnotation? {
+        guard let rect = location.lineRects.first else { return nil }
+        let annotation = PDFAnnotation(bounds: rect.cgRect, forType: .square, withProperties: nil)
+        let border = PDFBorder()
+        border.lineWidth = 2
+        annotation.border = border
         return annotation
     }
 

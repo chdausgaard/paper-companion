@@ -12,6 +12,14 @@ public struct RectRecord: Codable, Equatable, Sendable {
         self.width = width
         self.height = height
     }
+
+    public init(_ rect: CGRect) {
+        self.init(x: rect.origin.x, y: rect.origin.y, width: rect.size.width, height: rect.size.height)
+    }
+
+    public var cgRect: CGRect {
+        CGRect(x: x, y: y, width: width, height: height)
+    }
 }
 
 public struct TextRangeRecord: Codable, Equatable, Sendable {
@@ -74,6 +82,74 @@ public struct SelectionSnapshot: Codable, Equatable, Sendable {
     public var primaryPageLabel: String? { locations.first?.pageLabel }
 }
 
+/// What a highlight record anchors: highlighted text, or a box drawn over a
+/// figure, table or other non-text area.
+///
+/// A string wrapper rather than an enum so that a kind written by a newer
+/// build survives a load and save here instead of failing the whole file.
+/// Compare with `==`; a `switch` needs a `default`.
+public struct HighlightKind: RawRepresentable, Codable, Hashable, Sendable {
+    public var rawValue: String
+
+    public init(rawValue: String) {
+        self.rawValue = rawValue
+    }
+
+    /// Highlighted text. The default, and what every record written before
+    /// regions existed decodes as.
+    public static let text = HighlightKind(rawValue: "text")
+    /// A box the user drew on one page. Its rectangle is the single entry in
+    /// `locations[0].lineRects`; the rest lives in `HighlightRecord.region`.
+    public static let region = HighlightKind(rawValue: "region")
+}
+
+/// What the agent needs to understand a region: pictures of it and the text
+/// the PDF itself carries inside it. Stored on the highlight as `region`,
+/// only when `kind == .region`.
+public struct RegionDetails: Codable, Equatable, Sendable {
+    /// Session-relative path of the boxed area rendered from the PDF, with a
+    /// small margin: `regions/<highlightID>.png`.
+    public var imagePath: String
+    /// Session-relative path of the whole page with the box outlined:
+    /// `regions/<highlightID>-page.png`.
+    public var pageImagePath: String
+    /// The PDF's own text layer inside the box (axis labels, tick values,
+    /// panel titles, table cells), verbatim. Empty for a raster figure.
+    public var textInRegion: String
+    /// The caption-like line ("Figure 3", "Table 2", …) nearest the box.
+    /// Picked by a heuristic, hence the name: it can be wrong, and nil means
+    /// no such line was found on the page.
+    public var captionGuess: String?
+    /// Character offset in the page text that the region sorts at, so it sits
+    /// between the paragraphs around it in reading order. Nil on a page
+    /// without a text layer.
+    public var readingOffset: Int?
+
+    public init(
+        imagePath: String,
+        pageImagePath: String,
+        textInRegion: String = "",
+        captionGuess: String? = nil,
+        readingOffset: Int? = nil
+    ) {
+        self.imagePath = imagePath
+        self.pageImagePath = pageImagePath
+        self.textInRegion = textInRegion
+        self.captionGuess = captionGuess
+        self.readingOffset = readingOffset
+    }
+
+    // Decoded by hand so that a record missing an optional part still loads.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        imagePath = try container.decode(String.self, forKey: .imagePath)
+        pageImagePath = try container.decode(String.self, forKey: .pageImagePath)
+        textInRegion = try container.decodeIfPresent(String.self, forKey: .textInRegion) ?? ""
+        captionGuess = try container.decodeIfPresent(String.self, forKey: .captionGuess)
+        readingOffset = try container.decodeIfPresent(Int.self, forKey: .readingOffset)
+    }
+}
+
 public struct HighlightRecord: Codable, Equatable, Identifiable, Sendable {
     public var id: UUID
     public var quote: String
@@ -84,6 +160,10 @@ public struct HighlightRecord: Codable, Equatable, Identifiable, Sendable {
     public var color: String
     public var createdAt: Date
     public var deletedAt: Date?
+    /// `.text` for highlighted text, `.region` for a drawn box.
+    public var kind: HighlightKind
+    /// Images, text and caption guess of a region; nil for text highlights.
+    public var region: RegionDetails?
 
     public init(
         id: UUID = UUID(),
@@ -94,7 +174,9 @@ public struct HighlightRecord: Codable, Equatable, Identifiable, Sendable {
         locations: [HighlightLocation],
         color: String = "yellow",
         createdAt: Date = Date(),
-        deletedAt: Date? = nil
+        deletedAt: Date? = nil,
+        kind: HighlightKind = .text,
+        region: RegionDetails? = nil
     ) {
         self.id = id
         self.quote = quote
@@ -105,10 +187,39 @@ public struct HighlightRecord: Codable, Equatable, Identifiable, Sendable {
         self.color = color
         self.createdAt = createdAt
         self.deletedAt = deletedAt
+        self.kind = kind
+        self.region = region
+    }
+
+    // Decoded by hand so that sessions written before `kind` and `region`
+    // existed still load, as text highlights.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        quote = try container.decode(String.self, forKey: .quote)
+        normalizedQuote = try container.decodeIfPresent(String.self, forKey: .normalizedQuote) ?? quote.normalizedForSearch
+        prefix = try container.decodeIfPresent(String.self, forKey: .prefix) ?? ""
+        suffix = try container.decodeIfPresent(String.self, forKey: .suffix) ?? ""
+        locations = try container.decode([HighlightLocation].self, forKey: .locations)
+        color = try container.decodeIfPresent(String.self, forKey: .color) ?? "yellow"
+        createdAt = try container.decode(Date.self, forKey: .createdAt)
+        deletedAt = try container.decodeIfPresent(Date.self, forKey: .deletedAt)
+        kind = try container.decodeIfPresent(HighlightKind.self, forKey: .kind) ?? .text
+        region = try container.decodeIfPresent(RegionDetails.self, forKey: .region)
     }
 
     public var pageIndex: Int { locations.first?.pageIndex ?? 0 }
     public var pageLabel: String { locations.first?.pageLabel ?? String(pageIndex + 1) }
+
+    public var isRegion: Bool { kind == .region }
+
+    /// The box of a region in page space (the space of `lineRects`, what
+    /// `PDFView.convert(_:to: page)` returns), on page `pageIndex`. Nil for a
+    /// text highlight.
+    public var regionRect: CGRect? {
+        guard isRegion else { return nil }
+        return locations.first?.lineRects.first?.cgRect
+    }
 }
 
 public struct CommentRecord: Codable, Equatable, Identifiable, Sendable {
@@ -280,6 +391,10 @@ public struct CurrentContext: Codable, Equatable, Sendable {
     public var textStatus: String
     public var readingMode: ReadingMode
     public var furthestPageIndex: Int
+    /// Set when the active anchor is a region: where its images are and what
+    /// text and caption guess it carries. Nil otherwise, and then left out of
+    /// the JSON.
+    public var activeRegion: RegionDetails?
     public var updatedAt: Date
 
     public init(
@@ -296,6 +411,7 @@ public struct CurrentContext: Codable, Equatable, Sendable {
         textStatus: String,
         readingMode: ReadingMode = .preread,
         furthestPageIndex: Int = 0,
+        activeRegion: RegionDetails? = nil,
         updatedAt: Date = Date()
     ) {
         self.schemaVersion = schemaVersion
@@ -311,6 +427,7 @@ public struct CurrentContext: Codable, Equatable, Sendable {
         self.textStatus = textStatus
         self.readingMode = readingMode
         self.furthestPageIndex = furthestPageIndex
+        self.activeRegion = activeRegion
         self.updatedAt = updatedAt
     }
 
@@ -329,6 +446,7 @@ public struct CurrentContext: Codable, Equatable, Sendable {
         textStatus = try container.decode(String.self, forKey: .textStatus)
         readingMode = try container.decodeIfPresent(ReadingMode.self, forKey: .readingMode) ?? .preread
         furthestPageIndex = try container.decodeIfPresent(Int.self, forKey: .furthestPageIndex) ?? pageIndex
+        activeRegion = try container.decodeIfPresent(RegionDetails.self, forKey: .activeRegion)
         updatedAt = try container.decode(Date.self, forKey: .updatedAt)
     }
 }
@@ -387,9 +505,13 @@ public struct ReadingPosition: Comparable, Equatable, Sendable {
 }
 
 extension HighlightRecord {
+    /// A region has no text range of its own; it sorts at the offset stored
+    /// when it was drawn, next to the text around it.
     public var readingPosition: ReadingPosition {
         let first = locations.min { $0.pageIndex < $1.pageIndex }
-        let offset = first?.textRanges.map(\.location).min() ?? Int.max
+        let offset = isRegion
+            ? (region?.readingOffset ?? Int.max)
+            : (first?.textRanges.map(\.location).min() ?? Int.max)
         return ReadingPosition(
             pageIndex: first?.pageIndex ?? 0,
             offset: offset,
@@ -444,11 +566,16 @@ public struct AnnotationEntry: Identifiable, Equatable, Sendable {
     }
 
     /// What the entry's card shows: its comments, or the quote when the entry
-    /// is a highlight with no comment. Search matches only this, so a card is
-    /// never found by text the reader cannot see on it.
+    /// is a highlight with no comment, or the caption guess when it is a region
+    /// with no comment. Search matches only this, so a card is never found by
+    /// text the reader cannot see on it.
     public var displayedTexts: [String] {
         if !comments.isEmpty { return comments.map(\.verbatim) }
-        return highlight.map { [$0.quote.normalizedForSearch] } ?? []
+        guard let highlight else { return [] }
+        if highlight.isRegion {
+            return highlight.region?.captionGuess.map { [$0] } ?? []
+        }
+        return [highlight.quote.normalizedForSearch]
     }
 
     /// Entries grouped under their page, keeping the order they arrive in.

@@ -37,6 +37,75 @@ public struct SessionPaths: Equatable, Sendable {
     /// the user's own folder free of conversion clutter.
     public var cache: URL { root.appendingPathComponent("cache", isDirectory: true) }
     public var paperMarkdown: URL { cache.appendingPathComponent("paper.md") }
+
+    /// App-owned images of region anchors, two per region, written once when
+    /// the region is drawn. Created on first use, not with the session.
+    public var regions: URL { root.appendingPathComponent("regions", isDirectory: true) }
+
+    /// Session-relative path of a region's crop, as stored in `RegionDetails`.
+    public static func regionImagePath(for id: UUID) -> String {
+        "regions/\(id.uuidString).png"
+    }
+
+    /// Session-relative path of a region's page image with the box outlined.
+    public static func regionPageImagePath(for id: UUID) -> String {
+        "regions/\(id.uuidString)-page.png"
+    }
+
+    /// An existing file named by a path stored relative to the session
+    /// folder, or nil when the path is absolute, does not exist, or resolves
+    /// (through `..` or symlinks) to anything outside the session. Stored
+    /// paths come from files on disk, so they are never trusted as they are.
+    public func url(forSessionRelativePath path: String) -> URL? {
+        guard let rootReal = Self.realPath(root) else { return nil }
+        return contained(path, within: rootReal)
+    }
+
+    /// The crop image of a region, or nil for a text highlight, a missing
+    /// file, or a stored path that does not resolve to a file directly inside
+    /// this session's `regions/` folder.
+    public func regionImage(of highlight: HighlightRecord) -> URL? {
+        guard highlight.isRegion, let region = highlight.region else { return nil }
+        return regionFile(region.imagePath)
+    }
+
+    /// The page image of a region, with the same checks as `regionImage(of:)`.
+    public func regionPageImage(of highlight: HighlightRecord) -> URL? {
+        guard highlight.isRegion, let region = highlight.region else { return nil }
+        return regionFile(region.pageImagePath)
+    }
+
+    /// The real path of `regions/` when it exists and sits inside the
+    /// session; nil when it is missing or a symlink out of it.
+    var regionsRealPath: String? {
+        guard let rootReal = Self.realPath(root),
+              let regionsReal = Self.realPath(regions),
+              regionsReal.hasPrefix(rootReal + "/") else { return nil }
+        return regionsReal
+    }
+
+    private func regionFile(_ path: String) -> URL? {
+        guard let regionsReal = regionsRealPath,
+              let url = contained(path, within: regionsReal),
+              let fileReal = Self.realPath(url),
+              (fileReal as NSString).deletingLastPathComponent == regionsReal else { return nil }
+        return url
+    }
+
+    private func contained(_ path: String, within directoryReal: String) -> URL? {
+        guard !path.isEmpty, !path.hasPrefix("/"), !path.hasPrefix("~"), !path.contains("\0") else { return nil }
+        let url = root.appendingPathComponent(path)
+        guard let fileReal = Self.realPath(url), fileReal.hasPrefix(directoryReal + "/") else { return nil }
+        return url
+    }
+
+    /// The path with `..` and every symlink resolved, or nil when nothing
+    /// exists there.
+    static func realPath(_ url: URL) -> String? {
+        guard let resolved = realpath(url.path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
+    }
 }
 
 /// Local reference material the generated agent protocol points to.
@@ -496,7 +565,7 @@ public struct SessionRepository {
 
         ## Ownership
 
-        - The app owns `session.json`, `state/`, `journal/`, `notes.md`, `comments.md`, `document-text.txt`, `bridge/current-context.*`, and `<paper>-annotated.pdf`. Do not edit them. The annotated PDF is a copy of the paper with the highlights and comments embedded for other viewers; it is regenerated from `state/` and `agent/replies/`, so read the JSON, not the PDF, for records.
+        - The app owns `session.json`, `state/`, `journal/`, `regions/`, `notes.md`, `comments.md`, `document-text.txt`, `bridge/current-context.*`, and `<paper>-annotated.pdf`. Do not edit them. The annotated PDF is a copy of the paper with the highlights and comments embedded for other viewers; it is regenerated from `state/` and `agent/replies/`, so read the JSON, not the PDF, for records.
         - You may edit only `agent/transcript.md`, `agent/shared-understanding.md`, and files below `agent/replies/`, `agent/excursions/`, and `cache/`.
         - `cache/` holds derived copies of the paper — `pdf2md` output as `cache/paper.md`, rendered figure images. Everything derived from the PDF goes here, never beside the user's original PDF.
         - Preserve dictated comments verbatim in `agent/transcript.md`. Put your interpretation in a separate labeled paragraph.
@@ -537,6 +606,16 @@ public struct SessionRepository {
         ## Replies the app shows
 
         For every `discuss` comment, write your response to `agent/replies/<commentID>.md` — the comment's `id` from `state/comments.json`, uppercase, plus `.md` — as plain Markdown, in addition to the transcript entry. The app watches that folder and shows the file directly under the comment it answers, next to the passage, so this is the version the user actually reads. Lead with the verdict, keep it to a few lines, and overwrite the file if your view changes later. Never create a reply file for a `quiet` note.
+
+        ## Region anchors
+
+        A comment can be anchored to a box instead of to highlighted text. When its `highlightID` points at a record in `state/highlights.json` with `kind: "region"`, the user drew that box around an area of one page — usually a figure or table — and the comment is about what is inside it. Such a record has an empty `quote`; what you need is in its `region` field. Records with `kind: "text"`, or with no `kind`, are ordinary highlights.
+
+        - **Look before you answer.** Open `region.imagePath` (`regions/<id>.png`) to see what he boxed: the area rendered from the PDF, with a small margin around the box. Open `region.pageImagePath` (`regions/<id>-page.png`) to see where it sits: the whole page with the box outlined in red. Both paths are relative to this directory. The box itself, in PDF points on page `pageIndex`, is `locations[0].lineRects[0]`.
+        - **`region.textInRegion` is verbatim evidence**: the PDF's own text layer inside the box — axis labels, tick values, panel titles, table cells. It is empty when the figure is a raster image.
+        - **`region.captionGuess` is a guess.** The app takes the caption-like line ("Figure 3", "Table 2", …) nearest the box, and it can belong to a neighbouring figure. Check it against the page image before you name the figure, and name the figure you checked, not the guess. When it is absent, no caption-like line was found on the page.
+        - `comments.md` gives each region its own section, and `bridge/current-context.json` carries `activeRegion` while a region is the active anchor.
+        - The rule under Environment gotchas stands: a reading of a rendered figure is the weakest evidence in the session and never outranks his. The images tell you which figure he means; they do not make your reading of it a fact.
 
         ## Interaction policy
 
