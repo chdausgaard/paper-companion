@@ -17,6 +17,8 @@ final class SaveFailureTests: XCTestCase {
     override func setUp() {
         super.setUp()
         restoreStandardDefaultsAfterTest()
+        // The real pointer on this Mac must not decide the result.
+        pinPointerStateForTest()
     }
 
     private var sessions: [RegionTestSession] = []

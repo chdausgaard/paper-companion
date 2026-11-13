@@ -132,6 +132,30 @@ extension XCTestCase {
         return try body()
     }
 
+    /// `withIdlePointer` for the whole test, from `setUp` to the end, put back
+    /// in a teardown block whichever way the test ends. The app also reads
+    /// the pointer outside event delivery (the PDF view checks
+    /// `NSEvent.pressedMouseButtons` when it resets its cursor after the
+    /// region tool), so pinning only around delivered events left the result
+    /// to whatever the real mouse was doing at that moment: a button held in
+    /// another app left the crosshair behind. Safe with `withIdlePointer`
+    /// inside it, which saves and restores whatever is installed. A test that
+    /// needs the button down says so through `KeyboardFocus.mouseIsDown`.
+    func pinPointerStateForTest() {
+        var restore: [(Method, IMP)] = []
+        if let hidden = class_getClassMethod(NSCursor.self, NSSelectorFromString("_isHidden")) {
+            let shown: @convention(block) (AnyClass) -> Bool = { _ in false }
+            restore.append((hidden, method_setImplementation(hidden, imp_implementationWithBlock(shown))))
+        }
+        if let buttons = class_getClassMethod(NSEvent.self, #selector(getter: NSEvent.pressedMouseButtons)) {
+            let none: @convention(block) (AnyClass) -> Int = { _ in 0 }
+            restore.append((buttons, method_setImplementation(buttons, imp_implementationWithBlock(none))))
+        }
+        addTeardownBlock {
+            for (method, original) in restore.reversed() { method_setImplementation(method, original) }
+        }
+    }
+
     /// Runs the run loop until `condition` holds or `timeout` passes, and
     /// says which. For effects that land a little later (a fade, a debounce),
     /// in place of a fixed pause that is too short on a busy machine.

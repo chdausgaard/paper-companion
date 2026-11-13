@@ -21,6 +21,8 @@ final class AppSnapshotTests: XCTestCase {
         super.setUp()
         // RegionTestSession sets auto-highlight, which AppState stores.
         restoreStandardDefaultsAfterTest()
+        // The real pointer on this Mac must not decide the result.
+        pinPointerStateForTest()
     }
 
     override func tearDown() {

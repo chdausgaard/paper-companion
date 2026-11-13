@@ -10,6 +10,12 @@ import XCTest
 ///
 ///     PAPER_COMPANION_SNAPSHOT_DIR=/tmp/snapshots swift test --filter Snapshot
 final class SidebarSnapshotTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        // The real pointer on this Mac must not decide the result.
+        pinPointerStateForTest()
+    }
+
     static let size = NSSize(width: 420, height: 760)
 
     struct Seed {

@@ -19,6 +19,8 @@ final class PDFSnapshotTests: XCTestCase {
         // AppState stores auto-highlight in the standard defaults; put the
         // test process's value back as it was, absence included.
         restoreStandardDefaultsAfterTest()
+        // The real pointer on this Mac must not decide the result.
+        pinPointerStateForTest()
     }
 
     static let pages = [

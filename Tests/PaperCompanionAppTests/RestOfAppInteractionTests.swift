@@ -15,6 +15,8 @@ final class RestOfAppInteractionTests: XCTestCase {
         super.setUp()
         // AppState stores auto-highlight in the standard defaults.
         restoreStandardDefaultsAfterTest()
+        // The real pointer on this Mac must not decide the result.
+        pinPointerStateForTest()
     }
 
     override func tearDown() {
