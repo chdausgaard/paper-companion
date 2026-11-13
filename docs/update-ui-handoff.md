@@ -17,6 +17,6 @@ Behavior:
 - Feature Request opens a prefilled GitHub issue draft; users review and submit in the browser (GitHub login may be needed).
 - Repository verified from README: chdausgaard/paper-companion.
 
-Release maintenance: bundled notes currently describe version 0.4.0; update the version condition and notes when changing VERSION. Other versions link to GitHub release notes.
+Release maintenance: bundled notes currently describe version 0.5.0 (full notes in `docs/release-notes-0.5.0.md`); update the version condition and notes when changing VERSION. Other versions link to GitHub release notes.
 
 Validation: `CLANG_MODULE_CACHE_PATH=/tmp/paper-companion-clang-cache swift test --disable-sandbox --filter AppUpdatesTests` passed (1 test, 6 numeric comparison assertions), compiling the full app. Ordinary swift build initially hit sandbox restrictions on the default clang cache. Live GitHub requests and browser issue submission were not exercised.

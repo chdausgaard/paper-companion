@@ -30,7 +30,7 @@ final class AppUpdates: ObservableObject {
 
     init(defaults: UserDefaults = .standard, bundle: Bundle = .main) {
         self.defaults = defaults
-        version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.0"
+        version = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.5.0"
         build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "development"
     }
 
@@ -49,11 +49,13 @@ final class AppUpdates: ObservableObject {
     func showWhatsNew() {
         notice = Notice(
             title: "What’s New in Paper Companion \(version)",
-            detail: version == "0.4.0" ? """
-            • Click a highlight and press Backspace to delete it and its linked comments. Undo restores them.
-            • Change highlight colors or remove highlights from the right-click menu.
-            • Reopen papers from the recent-paper library on the welcome screen.
-            • Check for updates and send feature requests directly from the app.
+            detail: version == "0.5.0" ? """
+            • Comment on a figure or table: press ⇧⌘R and drag a box over it. Your agent gets a picture of the box.
+            • Click anywhere on an entry in the Annotations list to open it. A comment no longer repeats the highlighted text.
+            • Search your comments with ⇧⌘F.
+            • Making a highlight puts the cursor in the comment box. Esc returns to the paper.
+            • Highlights, list entries, Library rows and tabs answer the pointer.
+            • Papers that hold a box open only in version 0.5.0 or later.
             """ : "This version of Paper Companion has been installed. Open the release notes for the full list of changes.",
             releaseURL: Self.releasesURL
         )

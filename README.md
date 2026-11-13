@@ -61,10 +61,10 @@ Sessions` and are never touched by an update.
 ## Core workflow
 
 1. Open a PDF with **⌘O**.
-2. Select text and press **⇧⌘H**, or enable **Auto-highlight selections** for drag-to-highlight reading. Click a highlight in the PDF or in the list and press **⌫** to remove it and its linked comments. Right-click a highlight to change its color or delete it; colors are saved and included in the annotated PDF. **⌘Z** restores the latest highlight or comment change.
+2. Select text and press **⇧⌘H**, or enable **Auto-highlight selections** for drag-to-highlight reading. A new highlight puts the cursor in the comment box, so you can type at once; **Esc** in an empty comment box returns the keyboard to the paper. Click a highlight in the PDF or in the list and press **⌫** to remove it and its linked comments. Right-click a highlight to change its color or delete it; colors are saved and included in the annotated PDF. **⌘Z** restores the latest highlight or comment change.
 3. Type a comment in the composer under the Annotations list and press **⌘↩**. With a selection or an active highlight it saves linked to that passage; otherwise it is anchored to the current page. **⇧⌘↩** forces a page-only comment.
 4. Press **⇧⌘M** for a **margin note** — anchored and recorded like any comment, but journalled so the agent files it without responding. This is for the reactions that are not worth a conversation: *nice explanation*, *this table is unreadable*, *lost the thread here*. They are read back at synthesis time, where a cluster of them on one section is itself a finding.
-5. The **Annotations** list shows every highlight and comment in paper order — the order of the passages, not the order you wrote them. Click an entry to expand it to full text and scroll the PDF to its passage; click a highlight in the PDF to select and expand its entry. Expanded comments can be edited in place with the pencil button. Agent replies appear under the comment they answer.
+5. The **Annotations** list shows every highlight and comment in paper order — the order of the passages, not the order you wrote them — under page headers. An entry with a comment shows the comment, not the highlighted text; a marker shows what it is attached to: a swatch in the highlight's color, a page glyph for a page-level comment, or a small picture for a box drawn on the page. Click anywhere on an entry to expand it to full text and scroll the PDF to its passage; click a highlight in the PDF to select and expand its entry. Hovering an entry lights its highlight on the page, and the other way round. Expanded comments can be edited in place with the pencil button. Agent replies appear under the comment they answer. **⇧⌘F** searches your comments.
 6. Keep document-level, unanchored Markdown notes in the Notes tab. The detachable Notes window carries the composer and document notes so the sidebar can stay on the list.
 7. Choose a **reading mode** in the Agent tab (or the Agent menu) and copy the agent prompt into your existing agent client.
 
@@ -97,7 +97,8 @@ Important files:
 - `comments.md`: generated readable projection of highlights, linked comments, and page-only comments.
 - `<paper>-annotated.pdf`: a copy of the paper with highlights and comments embedded as standard PDF annotations, so they show in Preview, Acrobat, Skim, or a Zotero import. Regenerated about a second after any highlight, comment, or agent reply changes; **File → Reveal Annotated PDF** finds it. It is a projection, not a record: edits made to it in other apps are not read back.
 - `state/comments.json`: structured source of truth for both comment types.
-- `state/highlights.json`: app-owned highlight geometry and exact quotations.
+- `state/highlights.json`: app-owned highlight geometry and exact quotations, and the boxes drawn on pages (`kind: "region"`).
+- `regions/`: app-owned pictures of those boxes for the agent, two per box, written once when the box is drawn.
 - `bridge/current-context.json`: small, current page/selection snapshot for agents.
 - `AGENTS.md`: instructions for an external filesystem-capable agent.
 - `agent/transcript.md`: agent-owned verbatim comment transcript.
@@ -105,6 +106,8 @@ Important files:
 - `agent/shared-understanding.md`: agent-owned evolving interpretation.
 - `agent/excursions/`: scoped research side trips, including the workshop synthesis.
 - `cache/`: agent-owned derived copies of the paper — `pdf2md` output as `cache/paper.md`, rendered figure pages. Keeps conversions out of the folder holding the original PDF.
+
+A session that holds a box is saved with `schemaVersion: 2` in `session.json`; all other sessions stay at 1. Builds before 0.5.0 refuse to open a version-2 session and write nothing to it, where they would otherwise strip the box data on their next save.
 
 `AGENTS.md` is app-owned and rewritten from the template in `Sources/PaperCompanionCore/SessionRepository.swift` every time a session is opened, so protocol changes reach papers you have already started. Edit the template, not the copy inside a session.
 
@@ -120,6 +123,12 @@ When a directory is missing, that section degrades to the discipline without the
 ```bash
 swift build
 swift test
+```
+
+The tests deliver real mouse and key events to the views in an off-screen window. Image tests, which render the sidebar, the PDF page, the Library and the tabs to PNG, are skipped unless `PAPER_COMPANION_SNAPSHOT_DIR` names a folder to write them to:
+
+```bash
+PAPER_COMPANION_SNAPSHOT_DIR=/tmp/paper-companion-snapshots swift test --filter Snapshot
 ```
 
 Package a local `.app`:
