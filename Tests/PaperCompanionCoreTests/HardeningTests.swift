@@ -296,6 +296,34 @@ final class HardeningTests: XCTestCase {
         XCTAssertEqual(try versionOnDisk(session.paths), 1)
     }
 
+    /// Lowering the version must wait until the region is gone from disk.
+    /// Here the save that would remove the last region cannot write the
+    /// records (state/ is read-only, as after a crash between the files):
+    /// session.json still says 2 while the region record is on disk, so a
+    /// build from before regions still refuses the session. Once the records
+    /// can be written, the same save lowers it to 1.
+    func testTheVersionIsLoweredOnlyAfterTheRegionIsGoneFromDisk() throws {
+        let session = try makeSession()
+        let region = region()
+        try repository.saveState(manifest: session.manifest, highlights: [textHighlight(), region], comments: [], notes: "", paths: session.paths)
+        XCTAssertEqual(try versionOnDisk(session.paths), 2)
+        let stateFolder = session.paths.highlights.deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: stateFolder.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stateFolder.path) }
+
+        let loaded = try repository.loadSession(at: session.paths.root)
+        let textOnly = loaded.highlights.filter { !$0.isRegion }
+        XCTAssertThrowsError(try repository.saveState(manifest: loaded.manifest, highlights: textOnly, comments: [], notes: "", paths: session.paths))
+
+        XCTAssertEqual(try versionOnDisk(session.paths), 2, "the guard stays up")
+        let onDisk = try JSONDecoder.paperCompanion.decode([HighlightRecord].self, from: Data(contentsOf: session.paths.highlights))
+        XCTAssertTrue(onDisk.contains { $0.id == region.id && $0.isRegion }, "while the region is still on disk")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: stateFolder.path)
+        try repository.saveState(manifest: loaded.manifest, highlights: textOnly, comments: [], notes: "", paths: session.paths)
+        XCTAssertEqual(try versionOnDisk(session.paths), 1)
+    }
+
     func testTheVersionRule() {
         XCTAssertEqual(SessionRepository.schemaVersion(for: []), 1)
         XCTAssertEqual(SessionRepository.schemaVersion(for: [textHighlight()]), 1)

@@ -89,7 +89,18 @@ final class AppState: ObservableObject {
     /// The color a new region gets, like a new highlight's.
     static let newRegionColor = HighlightColor.yellow
 
-    var undoManager = UndoManager()
+    /// Every app action is its own undo group (`registerUndoStep`), never
+    /// one folded together by event, so a failed undo or redo always concerns
+    /// exactly one action and can be put back whole.
+    var undoManager = AppState.makeUndoManager() {
+        didSet { undoManager.groupsByEvent = false }
+    }
+
+    static func makeUndoManager() -> UndoManager {
+        let manager = UndoManager()
+        manager.groupsByEvent = false
+        return manager
+    }
     /// Pointer hover linking the PDF page and the cards. Deliberately not
     /// `@Published`: see `AnnotationHover`.
     let annotationHover = AnnotationHover()
@@ -181,6 +192,7 @@ final class AppState: ObservableObject {
                 extractedText: extractedText
             )
             undoManager.removeAllActions()
+            pendingUndoBounces.removeAll()
             regionToolActive = false
             sourceURL = url
             document = pdfDocument
@@ -516,15 +528,14 @@ final class AppState: ObservableObject {
             comments[index].verbatim = previous
             comments[index].updatedAt = previousUpdatedAt
             errorMessage = "Could not update the comment: \(error.localizedDescription)" + rewriteFilesAfterFailedSave()
-            keepUndoEntryAfterFailure(actionName: "Edit Comment") { $0.updateComment(id, verbatim: text) }
+            undoStepFailed = true
             return false
         }
-        undoManager.registerUndo(withTarget: self) { target in
+        registerUndoStep("Edit Comment") { target in
             if target.updateComment(id, verbatim: previous) {
                 target.comments[index].updatedAt = previousUpdatedAt
             }
         }
-        undoManager.setActionName("Edit Comment")
         statusMessage = "Comment updated"
         return true
     }
@@ -570,14 +581,13 @@ final class AppState: ObservableObject {
         let actionName = region ? "Change Region Color" : "Change Highlight Color"
         do {
             try persistState(eventKind: region ? "region_color_changed" : "highlight_color_changed", recordID: id, origin: "app_action")
-            undoManager.registerUndo(withTarget: self) { $0.setHighlightColor(id, color: previous) }
-            undoManager.setActionName(actionName)
+            registerUndoStep(actionName) { $0.setHighlightColor(id, color: previous) }
         } catch {
             highlights[index].color = previous
             // The records may have been written before the journal failed:
             // write them back as they are now, so the files match the page.
             errorMessage = "Could not save the highlight color: \(error.localizedDescription)" + rewriteFilesAfterFailedSave()
-            keepUndoEntryAfterFailure(actionName: actionName) { $0.setHighlightColor(id, color: color) }
+            undoStepFailed = true
         }
     }
 
@@ -587,10 +597,9 @@ final class AppState: ObservableObject {
     }
 
     private func registerUndoForCreatedHighlight(_ id: UUID, actionName: String) {
-        undoManager.registerUndo(withTarget: self) { target in
+        registerUndoStep(actionName) { target in
             target.applyHighlightDeletion(id, deletedAt: Date(), actionName: actionName)
         }
-        undoManager.setActionName(actionName)
     }
 
     private func applyHighlightDeletion(_ id: UUID, deletedAt: Date?, actionName: String, restoringComments: [CommentRecord]? = nil) {
@@ -635,16 +644,13 @@ final class AppState: ObservableObject {
             comments = before.comments
             selectedHighlightID = before.selectedHighlightID
             errorMessage = "Could not update the highlight: \(error.localizedDescription)" + rewriteFilesAfterFailedSave()
-            keepUndoEntryAfterFailure(actionName: actionName) { target in
-                target.applyHighlightDeletion(id, deletedAt: deletedAt, actionName: actionName, restoringComments: restoringComments)
-            }
+            undoStepFailed = true
             return
         }
         // Saved and journalled: it happened, and ⌘Z reverses it.
-        undoManager.registerUndo(withTarget: self) { target in
+        registerUndoStep(actionName) { target in
             target.applyHighlightDeletion(id, deletedAt: previousDeletedAt, actionName: actionName, restoringComments: previousComments)
         }
-        undoManager.setActionName(actionName)
         do {
             try writePageContext()
         } catch {
@@ -694,12 +700,10 @@ final class AppState: ObservableObject {
             comments[index].status = previousStatus
             comments[index].updatedAt = previousUpdatedAt
             errorMessage = "Could not update the comment: \(error.localizedDescription)" + rewriteFilesAfterFailedSave()
-            keepUndoEntryAfterFailure(actionName: actionName) { target in
-                target.applyCommentState(id, status: status, updatedAt: updatedAt, actionName: actionName)
-            }
+            undoStepFailed = true
             return
         }
-        undoManager.registerUndo(withTarget: self) { target in
+        registerUndoStep(actionName) { target in
             target.applyCommentState(
                 id,
                 status: previousStatus,
@@ -707,7 +711,6 @@ final class AppState: ObservableObject {
                 actionName: actionName
             )
         }
-        undoManager.setActionName(actionName)
         statusMessage = restored
             ? "Comment restored"
             : "Comment deleted · ⌘Z to undo"
@@ -716,18 +719,24 @@ final class AppState: ObservableObject {
     func performUndo() {
         if let textUndoManager = focusedTextUndoManager, textUndoManager.canUndo {
             textUndoManager.undo()
-        } else if undoManager.canUndo {
+        } else {
+            // A recovery still pending from an undo started elsewhere comes
+            // first, so this undo takes the entry the user sees.
+            completePendingUndoBounces()
+            guard undoManager.canUndo else { return }
             undoManager.undo()
-            completeUndoBounce()
+            completePendingUndoBounces()
         }
     }
 
     func performRedo() {
         if let textUndoManager = focusedTextUndoManager, textUndoManager.canRedo {
             textUndoManager.redo()
-        } else if undoManager.canRedo {
+        } else {
+            completePendingUndoBounces()
+            guard undoManager.canRedo else { return }
             undoManager.redo()
-            completeUndoBounce()
+            completePendingUndoBounces()
         }
     }
 
@@ -1113,45 +1122,82 @@ final class AppState: ObservableObject {
         }
     }
 
-    private enum UndoBounce { case undo, redo }
-    /// Set by a failed undo or redo; performed as soon as the undo manager
-    /// has finished it. See `keepUndoEntryAfterFailure`.
-    private var pendingUndoBounce: (manager: UndoManager, step: UndoBounce, token: String)?
+    // MARK: Undo steps
 
-    /// A failed undo or redo changed nothing, so both stacks must end as they
-    /// were. The undo manager has already taken the entry off its stack, and
-    /// a plain registration would put it back only by clearing the redo
-    /// stack. Instead a one-off "bounce" entry goes on the opposite stack
-    /// (where registrations land during an undo or redo), and is performed at
-    /// once: performing it is itself a redo (or undo), during which the
-    /// failed entry is registered again on the stack it came from without
-    /// touching the other one. `repeatCall` is the call that failed.
-    private func keepUndoEntryAfterFailure(actionName: String, _ repeatCall: @escaping (AppState) -> Void) {
+    /// Set by an action whose save failed, so the undo step that ran it knows
+    /// to put itself back (`undoStep`). Reset before every step.
+    private var undoStepFailed = false
+
+    /// Registers `action` as the undo (or, while undoing, the redo) of what
+    /// was just done, as one group of its own.
+    private func registerUndoStep(_ actionName: String, _ action: @escaping (AppState) -> Void) {
         let manager = undoManager
-        guard manager.isUndoing || manager.isRedoing else { return }
-        let step: UndoBounce = manager.isUndoing ? .redo : .undo
-        manager.registerUndo(withTarget: self) { target in
-            manager.registerUndo(withTarget: target, handler: repeatCall)
+        let step = Self.undoStep(actionName, action)
+        if manager.isUndoing || manager.isRedoing {
+            // Inside the group the manager opened for the undo or redo.
+            manager.registerUndo(withTarget: self, handler: step)
             manager.setActionName(actionName)
+        } else {
+            manager.beginUndoGrouping()
+            manager.registerUndo(withTarget: self, handler: step)
+            manager.setActionName(actionName)
+            manager.endUndoGrouping()
         }
-        // A name no real action has, so the bounce is performed only while
-        // it is still the top entry. Never shown: it is gone before the menu
-        // can be read.
-        let token = "Paper Companion undo bounce \(UUID().uuidString)"
-        manager.setActionName(token)
-        pendingUndoBounce = (manager, step, token)
-        // ⌘Z and ⇧⌘Z complete it at once (`performUndo`, `performRedo`);
-        // this covers an undo started some other way.
-        Task { @MainActor [weak self] in self?.completeUndoBounce() }
     }
 
-    private func completeUndoBounce() {
-        guard let (manager, step, token) = pendingUndoBounce else { return }
-        pendingUndoBounce = nil
-        guard !manager.isUndoing, !manager.isRedoing else { return }
-        switch step {
-        case .redo: if manager.canRedo, manager.redoActionName == token { manager.redo() }
-        case .undo: if manager.canUndo, manager.undoActionName == token { manager.undo() }
+    /// An undo entry that runs `action` and, if its save failed, puts this
+    /// same entry back where it came from, unchanged: a failed undo or redo
+    /// changed nothing, so both stacks must end as they were.
+    private static func undoStep(_ actionName: String, _ action: @escaping (AppState) -> Void) -> (AppState) -> Void {
+        { target in
+            target.undoStepFailed = false
+            action(target)
+            guard target.undoStepFailed else { return }
+            target.undoStepFailed = false
+            target.putBackUndoStep(undoStep(actionName, action), named: actionName)
+        }
+    }
+
+    private enum UndoBounce { case undo, redo }
+    /// Recoveries not yet completed, newest last. More than one is pending
+    /// only when undos are started without `performUndo`.
+    private var pendingUndoBounces: [(manager: UndoManager, step: UndoBounce, token: String)] = []
+
+    /// The manager has already taken the failed entry off its stack, and a
+    /// plain registration would put it back only by clearing the other stack.
+    /// So a one-off "bounce" entry goes on the opposite stack (where
+    /// registrations land during an undo or redo) and is performed as soon
+    /// as the undo or redo returns: performing it is itself a redo (or undo),
+    /// during which the entry is registered again on the stack it came from
+    /// without touching the other one.
+    private func putBackUndoStep(_ step: @escaping (AppState) -> Void, named actionName: String) {
+        let manager = undoManager
+        guard manager.isUndoing || manager.isRedoing else { return }
+        let direction: UndoBounce = manager.isUndoing ? .redo : .undo
+        manager.registerUndo(withTarget: self) { target in
+            manager.registerUndo(withTarget: target, handler: step)
+            manager.setActionName(actionName)
+        }
+        // A name no real action has, so a bounce is performed only while it
+        // is the top entry. Never shown: it is gone before the menu is read.
+        let token = "Paper Companion undo bounce \(UUID().uuidString)"
+        manager.setActionName(token)
+        pendingUndoBounces.append((manager, direction, token))
+        // `performUndo` and `performRedo` complete it at once; this covers an
+        // undo started some other way.
+        Task { @MainActor [weak self] in self?.completePendingUndoBounces() }
+    }
+
+    /// Newest first: each bounce is then the top of its stack, and the
+    /// entries go back in their original order.
+    private func completePendingUndoBounces() {
+        while let (manager, step, token) = pendingUndoBounces.last {
+            guard !manager.isUndoing, !manager.isRedoing else { return }
+            pendingUndoBounces.removeLast()
+            switch step {
+            case .redo: if manager.canRedo, manager.redoActionName == token { manager.redo() }
+            case .undo: if manager.canUndo, manager.undoActionName == token { manager.undo() }
+            }
         }
     }
 

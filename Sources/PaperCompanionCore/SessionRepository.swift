@@ -339,12 +339,17 @@ public struct SessionRepository {
         notes: String,
         paths: SessionPaths
     ) throws {
-        // The version follows the records and is written before them, so an
-        // older build never sees a region in a session it would open.
+        // The version follows the records, and the guard it is for must be
+        // up whenever a record that needs it is on disk: version 2 is written
+        // before the records, so it is there before a region is; version 1
+        // after them, so it is lowered only once no region is left. A save
+        // that fails part way, or an app that stops between the files, can
+        // leave a 2 that the next save lowers, never a 1 beside a region.
         var manifest = manifest
         manifest.schemaVersion = Self.schemaVersion(for: highlights)
+        let guardsRecords = manifest.schemaVersion > Self.baseSchemaVersion
         try createDirectories(paths)
-        try writeJSON(manifest, to: paths.manifest)
+        if guardsRecords { try writeJSON(manifest, to: paths.manifest) }
         try writeJSON(highlights, to: paths.highlights)
         try writeJSON(comments, to: paths.comments)
         try writeText(notes, to: paths.notes)
@@ -352,6 +357,7 @@ public struct SessionRepository {
             MarkdownExporter.renderComments(title: manifest.title, highlights: highlights, comments: comments),
             to: paths.commentsMarkdown
         )
+        if !guardsRecords { try writeJSON(manifest, to: paths.manifest) }
     }
 
     /// Rewrites the app-owned `AGENTS.md` for the manifest's reading mode.

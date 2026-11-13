@@ -660,6 +660,98 @@ final class SaveFailureTests: XCTestCase {
         XCTAssertEqual(state.highlights.first?.color, "blue")
     }
 
+    /// Codex's case for groups: a color change and the deletion of the same
+    /// highlight with no event between them (where NSUndoManager's grouping
+    /// by event would fold them into one undo group). Each is its own step,
+    /// so a failed restore loses nothing: once the disk recovers, ⌘Z restores
+    /// the highlight in green, and the next ⌘Z gives the yellow it had before.
+    @MainActor
+    func testActionsInOneEventStaySeparateUndoSteps() throws {
+        let session = try session()
+        let state = session.state
+        let highlight = try savedHighlight(session)
+        state.setHighlightColor(highlight.id, color: "green")
+        state.deleteHighlight(highlight.id)
+        XCTAssertTrue(state.activeHighlights.isEmpty)
+        try breakFile(session.paths.eventLog)
+
+        state.performUndo()
+        XCTAssertTrue(state.activeHighlights.isEmpty, "the restore could not be saved")
+        XCTAssertEqual(state.undoManager.undoActionName, "Remove Highlight")
+
+        try repairFile(session.paths.eventLog)
+        state.performUndo()
+        XCTAssertEqual(state.activeHighlights.first?.color, "green", "restored as it was when removed")
+        state.performUndo()
+        XCTAssertEqual(state.activeHighlights.first?.color, "yellow", "and the color change is its own step")
+        XCTAssertEqual(try highlightsOnDisk(session).first?.color, "yellow")
+    }
+
+    /// Codex's case for a pending recovery: an undo started outside ⌘Z fails
+    /// and, before its recovery has run, ⌘Z arrives. The recovery runs first,
+    /// so ⌘Z undoes blue to green, not green to yellow.
+    @MainActor
+    func testUndoWaitsForAPendingRecovery() throws {
+        let session = try session()
+        let state = session.state
+        _ = try threeColors(session)
+        try breakFile(session.paths.eventLog)
+
+        state.undoManager.undo()
+        XCTAssertEqual(state.highlights.first?.color, "blue")
+        try repairFile(session.paths.eventLog)
+        state.performUndo()
+
+        XCTAssertEqual(state.highlights.first?.color, "green")
+        state.performUndo()
+        XCTAssertEqual(state.highlights.first?.color, "yellow")
+    }
+
+    /// Two failed undos started outside ⌘Z before either recovery runs: both
+    /// entries go back, in their order, and the redo stack is untouched.
+    @MainActor
+    func testTwoPendingRecoveriesBothComeBackInOrder() throws {
+        let session = try session()
+        let state = session.state
+        _ = try threeColors(session)
+        try breakFile(session.paths.eventLog)
+
+        state.undoManager.undo()
+        state.undoManager.undo()
+        XCTAssertEqual(state.highlights.first?.color, "blue")
+        try repairFile(session.paths.eventLog)
+
+        state.performUndo()
+        XCTAssertEqual(state.highlights.first?.color, "green")
+        state.performUndo()
+        XCTAssertEqual(state.highlights.first?.color, "yellow")
+        state.performRedo()
+        state.performRedo()
+        XCTAssertEqual(state.highlights.first?.color, "blue")
+        XCTAssertFalse(state.undoManager.canRedo)
+        nextEvent()
+        XCTAssertEqual(state.highlights.first?.color, "blue", "nothing left to run later")
+    }
+
+    /// The undo of an edit restores the comment's time as well as its text,
+    /// also when it is retried after a failure.
+    @MainActor
+    func testARetriedUndoOfAnEditRestoresItsTime() throws {
+        let session = try session()
+        let state = session.state
+        let comment = try savedComment(session)
+        state.updateComment(comment.id, verbatim: "Is this really identified?")
+        nextEvent()
+        try breakFile(session.paths.eventLog)
+        state.performUndo()
+        XCTAssertEqual(state.comments.first?.verbatim, "Is this really identified?")
+
+        try repairFile(session.paths.eventLog)
+        state.performUndo()
+        XCTAssertEqual(state.comments.first?.verbatim, "Is this identified?")
+        XCTAssertEqual(state.comments.first?.updatedAt, comment.updatedAt)
+    }
+
     // MARK: Regions and the session format
 
     /// A region raises the session to version 2, in memory and on disk, and
@@ -682,12 +774,32 @@ final class SaveFailureTests: XCTestCase {
         XCTAssertEqual(try SessionRepository().loadSession(at: session.paths.root).manifest.schemaVersion, 2)
     }
 
-    /// A first region whose save fails part way (comments.json, after
-    /// session.json said 2 and highlights.json held the region): memory and
-    /// records are put back, the failed write back is reported, and
-    /// session.json is back at 1, so older builds can still open the session.
+    /// A first region whose journal event fails after session.json (2) and
+    /// highlights.json (with the region) were written: the rollback writes
+    /// the records without it and only then session.json, back at 1, so
+    /// older builds can open the session again.
     @MainActor
-    func testAFailedFirstRegionSaveEndsAtVersionOne() throws {
+    func testARolledBackFirstRegionEndsAtVersionOne() throws {
+        let session = try session()
+        let state = session.state
+        let page = try XCTUnwrap(session.document.page(at: 0))
+        try breakFile(session.paths.eventLog)
+
+        XCTAssertNil(state.createRegion(on: page, rect: FigurePDF.figure))
+
+        XCTAssertTrue(state.highlights.isEmpty)
+        XCTAssertTrue(try highlightsOnDisk(session).isEmpty)
+        XCTAssertFalse(try XCTUnwrap(state.errorMessage).contains("could not be put back"), "the rollback worked")
+        XCTAssertEqual(try versionOnDisk(session), 1)
+        XCTAssertEqual(state.manifest?.schemaVersion, 1)
+    }
+
+    /// The rollback itself fails part way (comments.json, after it wrote
+    /// highlights.json without the region): session.json is written last
+    /// when lowering, so it still says 2. A 2 without a region is only a
+    /// leftover; the next save that works lowers it.
+    @MainActor
+    func testARollbackThatFailsPartWayLeavesTheGuardUp() throws {
         let session = try session()
         let state = session.state
         let page = try XCTUnwrap(session.document.page(at: 0))
@@ -700,24 +812,33 @@ final class SaveFailureTests: XCTestCase {
         let message = try XCTUnwrap(state.errorMessage)
         XCTAssertTrue(message.hasPrefix("Could not save the region:"), message)
         XCTAssertTrue(message.contains("could not be put back"), message)
-        XCTAssertEqual(try versionOnDisk(session), 1)
-        XCTAssertEqual(state.manifest?.schemaVersion, 1)
+        XCTAssertEqual(try versionOnDisk(session), 2, "not lowered by a save that did not finish")
+
+        try repairFile(session.paths.comments)
+        state.saveNotes()
+        XCTAssertEqual(try versionOnDisk(session), 1, "the next save lowers it")
     }
 
-    /// The same when highlights.json itself cannot be written: session.json
-    /// said 2 before the region failed to reach disk, and goes back to 1.
+    /// highlights.json cannot be written at all: the region never reached
+    /// it, session.json keeps the 2 written before it, and the next save
+    /// that works lowers it.
     @MainActor
-    func testAFirstRegionThatNeverReachesHighlightsLeavesVersionOne() throws {
+    func testAFirstRegionThatNeverReachesHighlightsLeavesALeftoverTwo() throws {
         let session = try session()
         let state = session.state
         let page = try XCTUnwrap(session.document.page(at: 0))
+        let before = try highlightsOnDisk(session)
         try breakFile(session.paths.highlights)
 
         XCTAssertNil(state.createRegion(on: page, rect: FigurePDF.figure))
 
         XCTAssertTrue(state.highlights.isEmpty)
-        XCTAssertEqual(try versionOnDisk(session), 1)
+        XCTAssertEqual(try versionOnDisk(session), 2)
         XCTAssertTrue(try XCTUnwrap(state.errorMessage).contains("could not be put back"))
+        try repairFile(session.paths.highlights)
+        state.saveNotes()
+        XCTAssertEqual(try versionOnDisk(session), 1)
+        XCTAssertEqual(try highlightsOnDisk(session), before)
     }
 
     @MainActor
