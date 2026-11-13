@@ -205,6 +205,237 @@ struct IconButtonStyle: ButtonStyle {
     }
 }
 
+private struct PointerOverridesKey: EnvironmentKey {
+    static let defaultValue: [String: PointerState] = [:]
+}
+
+extension EnvironmentValues {
+    /// Draws the surfaces with these keys (a Library row's paper path, an
+    /// inspector tab's name) as hovered or pressed regardless of the real
+    /// pointer, for the snapshot harness. `cardPointerOverrides` does the
+    /// same for annotation cards.
+    var pointerOverrides: [String: PointerState] {
+        get { self[PointerOverridesKey.self] }
+        set { self[PointerOverridesKey.self] = newValue }
+    }
+}
+
+/// The background of a row that stands on its own, like a paper in the
+/// Library: a faint fill at rest, lifted on hover (an opaque surface with a
+/// soft offset shadow), pressed back down while the mouse is down. A row
+/// that cannot do its job (the PDF is missing) never lifts: a faint fill on
+/// hover says it still answers a click, with an explanation.
+struct RowSurfaceBackground: View {
+    var pointer: PointerState
+    var isAvailable = true
+    var cornerRadius: CGFloat = 10
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        let dark = colorScheme == .dark
+        let lifted = pointer == .hovered && isAvailable
+        ZStack {
+            if lifted {
+                // Light: the white control surface. Dark: a lighter gray, since
+                // the dark control surface is darker than the window and would
+                // read as sunk.
+                shape
+                    .fill(dark ? Color.white.opacity(0.1) : Color(nsColor: .controlBackgroundColor))
+                    .shadow(color: .black.opacity(dark ? 0.4 : 0.11), radius: 6, x: 0, y: 2)
+            } else {
+                shape.fill(Color.primary.opacity(restingFill(dark: dark)))
+            }
+            shape.strokeBorder(Color.primary.opacity(lifted ? (dark ? 0.12 : 0.07) : 0), lineWidth: 1)
+        }
+    }
+
+    private func restingFill(dark: Bool) -> Double {
+        switch pointer {
+        case .idle: return dark ? 0.05 : 0.035
+        case .hovered: return dark ? 0.08 : 0.06
+        case .pressed: return dark ? 0.13 : 0.09
+        }
+    }
+}
+
+/// A borderless control that is a whole area (a disclosure header, the
+/// session path): no fill at rest, a faint one on hover, a firmer one while
+/// pressed, like the icon buttons and the cards.
+struct SurfaceButtonStyle: ButtonStyle {
+    var cornerRadius: CGFloat = 6
+    /// A key into `pointerOverrides`, for the snapshot harness.
+    var overrideKey: String?
+
+    func makeBody(configuration: Configuration) -> some View {
+        SurfaceButtonBody(configuration: configuration, cornerRadius: cornerRadius, overrideKey: overrideKey)
+    }
+
+    private struct SurfaceButtonBody: View {
+        let configuration: ButtonStyleConfiguration
+        let cornerRadius: CGFloat
+        let overrideKey: String?
+        @State private var hovering = false
+        @Environment(\.pointerOverrides) private var overrides
+        @Environment(\.colorScheme) private var colorScheme
+
+        private var pointer: PointerState {
+            if let key = overrideKey, let forced = overrides[key] { return forced }
+            if configuration.isPressed { return .pressed }
+            return hovering ? .hovered : .idle
+        }
+
+        var body: some View {
+            let dark = colorScheme == .dark
+            configuration.label
+                .contentShape(Rectangle())
+                .background(
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .fill(Color.primary.opacity(pointer == .pressed ? (dark ? 0.13 : 0.09) : pointer == .hovered ? (dark ? 0.08 : 0.05) : 0))
+                )
+                .environment(\.surfacePointer, pointer)
+                .onHover { hovering = $0 }
+                .animation(InteractionStyle.hover, value: pointer)
+        }
+    }
+}
+
+private struct SurfacePointerKey: EnvironmentKey {
+    static let defaultValue = PointerState.idle
+}
+
+extension EnvironmentValues {
+    /// The pointer state of the enclosing `SurfaceButtonStyle` button, so its
+    /// label can show a detail (a copy glyph) only on hover.
+    var surfacePointer: PointerState {
+        get { self[SurfacePointerKey.self] }
+        set { self[SurfacePointerKey.self] = newValue }
+    }
+}
+
+/// A hover look for the system's bordered buttons, which have none on macOS:
+/// the button brightens a little under the pointer, as a pressed one darkens.
+struct ButtonHoverHighlight: ViewModifier {
+    @State private var hovering = false
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.isEnabled) private var isEnabled
+
+    func body(content: Content) -> some View {
+        content
+            .brightness(hovering && isEnabled ? (colorScheme == .dark ? 0.07 : -0.035) : 0)
+            .onHover { hovering = $0 }
+            .animation(InteractionStyle.hover, value: hovering)
+    }
+}
+
+extension View {
+    func hoverHighlight() -> some View { modifier(ButtonHoverHighlight()) }
+}
+
+/// A read-only block of text set into the surface around it (the agent's
+/// previews): a slightly darker well with a hairline edge.
+struct InsetPanelBackground: View {
+    @Environment(\.colorScheme) private var colorScheme
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 6, style: .continuous)
+        let dark = colorScheme == .dark
+        ZStack {
+            shape.fill(Color.black.opacity(dark ? 0.2 : 0.035))
+            shape.strokeBorder(Color.primary.opacity(dark ? 0.1 : 0.08), lineWidth: 1)
+        }
+    }
+}
+
+/// A disclosure section whose whole header row is the toggle, with the hover
+/// and pressed look of `SurfaceButtonStyle`. The chevron turns and the
+/// content fades in; Reduce Motion drops the turn and the height animation.
+struct HoverDisclosureStyle: DisclosureGroupStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HoverDisclosureBody(configuration: configuration)
+    }
+
+    private struct HoverDisclosureBody: View {
+        let configuration: DisclosureGroupStyleConfiguration
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    withAnimation(InteractionStyle.expand(reduceMotion: reduceMotion)) {
+                        configuration.isExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                            .rotationEffect(.degrees(configuration.isExpanded ? 90 : 0))
+                            .frame(width: 12)
+                        configuration.label
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(SurfaceButtonStyle())
+                // The hover fill reaches past the text column; the chevron
+                // stays aligned with the text above and below.
+                .padding(.horizontal, -6)
+                // SwiftUI still announces the section as a disclosure with its
+                // expanded state, as it does for the system style.
+
+                if configuration.isExpanded {
+                    configuration.content
+                        .transition(.opacity)
+                }
+            }
+        }
+    }
+}
+
+/// The frame of a multi-line text box (the comment box, the notes): a
+/// hairline edge at rest, the system's focus ring outside it while it has the
+/// keyboard, and a placeholder while it is empty. The placeholder sits where
+/// the first line of text starts.
+struct TextBoxChrome: ViewModifier {
+    var isFocused: Bool
+    /// Shown while the box is empty; nil when it has text.
+    var placeholder: String?
+    var textInset: NSSize
+
+    func body(content: Content) -> some View {
+        content
+            .overlay(alignment: .topLeading) {
+                if let placeholder {
+                    Text(placeholder)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        // NSTextView pads each line by 5 pt.
+                        .padding(.leading, textInset.width + 5)
+                        .padding(.top, textInset.height)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(isFocused ? 0 : 0.15), lineWidth: 1)
+            )
+            .overlay(
+                // The focus ring sits outside the box, like the system's.
+                RoundedRectangle(cornerRadius: 8.5, style: .continuous)
+                    .strokeBorder(Color(nsColor: .keyboardFocusIndicatorColor), lineWidth: 3)
+                    .padding(-2.5)
+                    .opacity(isFocused ? 1 : 0)
+                    .allowsHitTesting(false)
+            )
+            .animation(InteractionStyle.hover, value: isFocused)
+    }
+}
+
 /// Puts the keyboard in a view when a pending focus request is granted to it.
 @MainActor
 enum KeyboardFocus {

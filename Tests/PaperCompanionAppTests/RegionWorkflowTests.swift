@@ -8,6 +8,13 @@ import XCTest
 /// mouse and key events delivered in-process (see `TestSupport.swift`), in a
 /// real reading session in a temporary folder.
 final class RegionWorkflowTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        // AppState stores auto-highlight in the standard defaults; put the
+        // test process's value back as it was, absence included.
+        restoreStandardDefaultsAfterTest()
+    }
+
     private var sessions: [RegionTestSession] = []
 
     override func tearDown() {

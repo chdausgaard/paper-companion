@@ -14,6 +14,13 @@ import XCTest
 ///
 ///     PAPER_COMPANION_SNAPSHOT_DIR=/tmp/snapshots swift test --filter Snapshot
 final class PDFSnapshotTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        // AppState stores auto-highlight in the standard defaults; put the
+        // test process's value back as it was, absence included.
+        restoreStandardDefaultsAfterTest()
+    }
+
     static let pages = [
         """
         Effects of early rollout on turnout

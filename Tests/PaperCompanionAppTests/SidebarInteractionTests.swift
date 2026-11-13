@@ -6,6 +6,13 @@ import XCTest
 @testable import PaperCompanionCore
 
 final class SidebarInteractionTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        // AppState stores auto-highlight in the standard defaults; put the
+        // test process's value back as it was, absence included.
+        restoreStandardDefaultsAfterTest()
+    }
+
     // MARK: Fixtures
 
     private static let passage = "A theoretically important passage"

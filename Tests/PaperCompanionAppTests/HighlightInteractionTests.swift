@@ -5,6 +5,13 @@ import XCTest
 @testable import PaperCompanionCore
 
 final class HighlightInteractionTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        // AppState stores auto-highlight in the standard defaults; put the
+        // test process's value back as it was, absence included.
+        restoreStandardDefaultsAfterTest()
+    }
+
     // MARK: Fixtures
 
     static let pages = [

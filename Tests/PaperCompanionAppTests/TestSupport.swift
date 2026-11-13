@@ -261,9 +261,15 @@ enum FigurePDF {
 
 /// A real reading session in a temporary folder, with the figure PDF open,
 /// so regions can write their pictures and records as in the app. The
-/// session folder is removed by `remove()`.
+/// session folder is removed by `remove()`, which also puts back the
+/// auto-highlight preference the session turned off, as it was before the
+/// first live session (absence included).
 @MainActor
 final class RegionTestSession {
+    private static var liveSessions = 0
+    private static var savedAutoHighlight: Any?
+    private var removed = false
+
     let folder: URL
     let state: AppState
     let document: PDFDocument
@@ -279,6 +285,10 @@ final class RegionTestSession {
             sessionsRoot: folder.appendingPathComponent("Sessions", isDirectory: true)
         )
         document = try XCTUnwrap(PDFDocument(url: pdfURL))
+        if Self.liveSessions == 0 {
+            Self.savedAutoHighlight = UserDefaults.standard.object(forKey: "PaperCompanion.autoHighlightEnabled")
+        }
+        Self.liveSessions += 1
         state = AppState()
         state.autoHighlightEnabled = false
         state.manifest = session.manifest
@@ -290,6 +300,15 @@ final class RegionTestSession {
 
     func remove() {
         try? FileManager.default.removeItem(at: folder)
+        guard !removed else { return }
+        removed = true
+        Self.liveSessions -= 1
+        guard Self.liveSessions == 0 else { return }
+        if let saved = Self.savedAutoHighlight {
+            UserDefaults.standard.set(saved, forKey: "PaperCompanion.autoHighlightEnabled")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "PaperCompanion.autoHighlightEnabled")
+        }
     }
 }
 
@@ -570,5 +589,86 @@ enum SnapshotOutput {
         let data = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
         try data.write(to: url)
         return data.count
+    }
+}
+
+/// SwiftUI's accessibility elements, read in-process from the hosting view
+/// (the same tree VoiceOver gets; no accessibility permission is involved).
+/// Tests use them to find where a control is and what it announces.
+extension XCTestCase {
+    struct AccessibilityNode {
+        let element: NSObject
+        let label: String
+        let value: String
+        /// In the window's coordinates.
+        let frame: NSRect
+        var center: NSPoint { NSPoint(x: frame.midX, y: frame.midY) }
+    }
+
+    /// SwiftUI builds its elements only while an assistive app is using the
+    /// app, which it learns from the app's `AXEnhancedUserInterface`
+    /// attribute. That attribute is set on this process's own application
+    /// object for the walk and put back to what it was after it; nothing
+    /// outside the test process is involved.
+    @MainActor
+    func accessibilityNodes(under view: NSView) -> [AccessibilityNode] {
+        guard let window = view.window else { return [] }
+        let enhanced = NSAccessibility.Attribute(rawValue: "AXEnhancedUserInterface")
+        let previous = NSApp.accessibilityAttributeValue(enhanced)
+        NSApp.accessibilitySetValue(true, forAttribute: enhanced)
+        defer { NSApp.accessibilitySetValue(previous ?? false, forAttribute: enhanced) }
+        spin(0.15)
+        var nodes: [AccessibilityNode] = []
+        // SwiftUI's elements do not declare the protocol; read them by key.
+        func visit(_ object: Any, depth: Int) {
+            guard depth < 40, let element = object as? NSObject else { return }
+            func read(_ key: String) -> Any? {
+                element.responds(to: NSSelectorFromString(key)) ? element.value(forKey: key) : nil
+            }
+            let label = [read("accessibilityLabel"), read("accessibilityTitle")]
+                .compactMap { $0 as? String }.first { !$0.isEmpty } ?? ""
+            let value = read("accessibilityValue").map { "\($0)" } ?? ""
+            let frame = (read("accessibilityFrame") as? NSValue)?.rectValue ?? .zero
+            nodes.append(AccessibilityNode(element: element, label: label, value: value, frame: window.convertFromScreen(frame)))
+            for child in (read("accessibilityChildren") as? [Any]) ?? [] { visit(child, depth: depth + 1) }
+        }
+        visit(view, depth: 0)
+        return nodes
+    }
+
+    /// The first element whose label is `label`, optionally only inside `area`
+    /// (window coordinates).
+    @MainActor
+    func accessibilityNode(labeled label: String, under view: NSView, in area: NSRect? = nil) -> AccessibilityNode? {
+        accessibilityNodes(under: view).first { node in
+            node.label == label && !node.frame.isEmpty && (area.map { $0.contains(node.center) } ?? true)
+        }
+    }
+
+    /// A real click at `point`, with first mouse accepted by the view the
+    /// window hit-tests there (see `withFirstMouseAccepted`).
+    @MainActor
+    func realClick(atWindowPoint point: NSPoint, in window: NSWindow, settle: TimeInterval = 0.3) {
+        guard let hit = hitView(atWindowPoint: point, in: window) else {
+            return XCTFail("nothing to click at \(point)")
+        }
+        withFirstMouseAccepted(by: [type(of: hit)]) {
+            click(atWindowPoint: point, in: window, settle: settle)
+        }
+    }
+}
+
+/// Preferences the app stores in `UserDefaults.standard` (the test process's
+/// own domain), put back as they were, absence included, when the test ends.
+extension XCTestCase {
+    static let appStoredDefaults = ["PaperCompanion.autoHighlightEnabled"]
+
+    func restoreStandardDefaultsAfterTest(_ keys: [String] = appStoredDefaults) {
+        let saved = keys.map { ($0, UserDefaults.standard.object(forKey: $0)) }
+        addTeardownBlock {
+            for (key, value) in saved {
+                if let value { UserDefaults.standard.set(value, forKey: key) } else { UserDefaults.standard.removeObject(forKey: key) }
+            }
+        }
     }
 }
