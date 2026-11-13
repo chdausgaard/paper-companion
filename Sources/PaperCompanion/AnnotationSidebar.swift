@@ -664,8 +664,11 @@ struct AnnotationCard: View {
                 HStack {
                     Button("Cancel") { editingCommentID = nil }
                     Button("Save") {
-                        state.updateComment(comment.id, verbatim: editDraft)
-                        editingCommentID = nil
+                        // An edit that could not be saved stays open, so
+                        // the user's new wording is not lost.
+                        if state.updateComment(comment.id, verbatim: editDraft) {
+                            editingCommentID = nil
+                        }
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(editDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)

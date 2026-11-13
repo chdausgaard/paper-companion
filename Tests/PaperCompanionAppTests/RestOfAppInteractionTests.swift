@@ -130,9 +130,12 @@ final class RestOfAppInteractionTests: XCTestCase {
         let tracker = try hoverTracker(at: removePoint, in: window)
         pointer(.mouseEntered, atWindowPoint: removePoint, trackedBy: tracker)
         pointer(.mouseMoved, atWindowPoint: removePoint, trackedBy: tracker)
-        spin(0.3)
-        let remove = try XCTUnwrap(accessibilityNode(labeled: "Remove \(papers[0].title) from recent papers", under: root),
-                                   "the remove control showed on hover")
+        var shown: AccessibilityNode?
+        waitForHover(redeliver: { pointer(.mouseMoved, atWindowPoint: removePoint, trackedBy: tracker) }) {
+            shown = accessibilityNode(labeled: "Remove \(papers[0].title) from recent papers", under: root)
+            return shown != nil
+        }
+        let remove = try XCTUnwrap(shown, "the remove control showed on hover")
         XCTAssertTrue(remove.frame.contains(removePoint), "it sits at the row's end: \(remove.frame)")
         realClick(atWindowPoint: remove.center, in: window)
         XCTAssertEqual(store.papers.map(\.title), ["Bravo paper whose PDF moved", "Charlie paper on timing"], "the remove control removed its paper")

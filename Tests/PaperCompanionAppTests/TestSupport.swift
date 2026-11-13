@@ -96,8 +96,72 @@ extension XCTestCase {
     @MainActor
     func moveMouse(toWindowPoint location: NSPoint, in window: NSWindow, settle: TimeInterval = 0.02) {
         window.acceptsMouseMovedEvents = true
-        window.sendEvent(mouseEvent(.mouseMoved, at: location, in: window))
+        withIdlePointer {
+            window.sendEvent(mouseEvent(.mouseMoved, at: location, in: window))
+        }
         spin(settle)
+    }
+
+    /// Delivers `body`'s pointer events as from a pointer that is shown and
+    /// has no button down, whatever the real one on this Mac is doing.
+    ///
+    /// SwiftUI drops hover while the system hides the pointer: on every
+    /// entered and moved event its hover handler asks `+[NSCursor _isHidden]`
+    /// and ignores the event when the answer is yes. macOS hides the pointer
+    /// in every app as soon as someone types anywhere, until the mouse moves
+    /// again, so on a Mac in use the answer depends on whether its owner typed
+    /// before the run (typing `swift test` is enough), and hover tests failed
+    /// whenever he had. Found 2026-11-13 on macOS 27.2 by counting the calls
+    /// and forcing the answer. The PDF view also reads the real
+    /// `NSEvent.pressedMouseButtons` to choose its hover cursor, so a button
+    /// held anywhere on the Mac would change what it does. Both answers are
+    /// fixed while `body` runs and put back after it; nothing outside this
+    /// process is touched. A method that has gone away is left alone.
+    @MainActor
+    func withIdlePointer<T>(_ body: () throws -> T) rethrows -> T {
+        var restore: [(Method, IMP)] = []
+        if let hidden = class_getClassMethod(NSCursor.self, NSSelectorFromString("_isHidden")) {
+            let shown: @convention(block) (AnyClass) -> Bool = { _ in false }
+            restore.append((hidden, method_setImplementation(hidden, imp_implementationWithBlock(shown))))
+        }
+        if let buttons = class_getClassMethod(NSEvent.self, #selector(getter: NSEvent.pressedMouseButtons)) {
+            let none: @convention(block) (AnyClass) -> Int = { _ in 0 }
+            restore.append((buttons, method_setImplementation(buttons, imp_implementationWithBlock(none))))
+        }
+        defer { for (method, original) in restore.reversed() { method_setImplementation(method, original) } }
+        return try body()
+    }
+
+    /// Runs the run loop until `condition` holds or `timeout` passes, and
+    /// says which. For effects that land a little later (a fade, a debounce),
+    /// in place of a fixed pause that is too short on a busy machine.
+    @MainActor
+    @discardableResult
+    func waitUntil(timeout: TimeInterval = 3, _ condition: () throws -> Bool) rethrows -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            if try condition() { return true }
+            if Date() >= deadline { return false }
+            spin(0.05)
+        }
+    }
+
+    /// Waits for a hover effect, delivering the pointer event again about
+    /// once a second if it has not shown, in case the app dropped it.
+    @MainActor
+    @discardableResult
+    func waitForHover(timeout: TimeInterval = 4, redeliver: () -> Void, _ condition: () throws -> Bool) rethrows -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        var nextDelivery = Date().addingTimeInterval(1)
+        while true {
+            if try condition() { return true }
+            if Date() >= deadline { return false }
+            if Date() >= nextDelivery {
+                redeliver()
+                nextDelivery = Date().addingTimeInterval(1)
+            }
+            spin(0.05)
+        }
     }
 
     /// The view a click at a window point goes to: hit-tested from the
@@ -114,6 +178,12 @@ extension XCTestCase {
     /// here the test names the owner. SwiftUI's `onHover` listens this way.
     @MainActor
     func pointer(_ type: NSEvent.EventType, atWindowPoint location: NSPoint, trackedBy view: NSView) {
+        withIdlePointer { deliverPointer(type, atWindowPoint: location, trackedBy: view) }
+        spin(0.02)
+    }
+
+    @MainActor
+    private func deliverPointer(_ type: NSEvent.EventType, atWindowPoint location: NSPoint, trackedBy view: NSView) {
         guard let window = view.window else { return XCTFail("\(view) has no window") }
         let areas = view.trackingAreas.filter { $0.owner === view }
         XCTAssertFalse(areas.isEmpty, "\(Swift.type(of: view)) tracks nothing")
@@ -133,7 +203,6 @@ extension XCTestCase {
                 view.mouseMoved(with: mouseEvent(.mouseMoved, at: location, in: window))
             }
         }
-        spin(0.02)
     }
 
     /// A press, drag and release as the app receives them: posted to the
@@ -661,7 +730,9 @@ extension XCTestCase {
 /// Preferences the app stores in `UserDefaults.standard` (the test process's
 /// own domain), put back as they were, absence included, when the test ends.
 extension XCTestCase {
-    static let appStoredDefaults = ["PaperCompanion.autoHighlightEnabled"]
+    /// The recent-papers list is in here because every `AppState` builds a
+    /// `RecentPapersStore`, which writes its list on a first-run migration.
+    static let appStoredDefaults = ["PaperCompanion.autoHighlightEnabled", "PaperCompanion.recentPapers.v1"]
 
     func restoreStandardDefaultsAfterTest(_ keys: [String] = appStoredDefaults) {
         let saved = keys.map { ($0, UserDefaults.standard.object(forKey: $0)) }

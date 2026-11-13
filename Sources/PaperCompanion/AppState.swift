@@ -313,25 +313,37 @@ final class AppState: ObservableObject {
             suffix: snapshot.suffix,
             locations: snapshot.locations
         )
+        let previousSelection = (highlight: selectedHighlightID, comment: selectedCommentID)
         highlights.append(highlight)
         selectedHighlightID = highlight.id
         selectedCommentID = nil
         do {
             try persistState(eventKind: "highlight_created", recordID: highlight.id, origin: origin)
-            try writeSelectionContext(snapshot, activeHighlightID: highlight.id)
-            if registerUndo { registerUndoForCreatedHighlight(highlight.id, actionName: "Highlight") }
-            statusMessage = "Highlight saved · page \(highlight.pageLabel)"
-            if focusComposer {
-                revealInSidebar(highlight.id)
-                requestCommentFocus()
-            }
-            return highlight
         } catch {
+            // Not saved: it never happened, in memory or in the files.
             highlights.removeAll { $0.id == highlight.id }
-            if selectedHighlightID == highlight.id { selectedHighlightID = nil }
-            errorMessage = "Could not save the highlight: \(error.localizedDescription)"
+            selectedHighlightID = previousSelection.highlight
+            selectedCommentID = previousSelection.comment
+            errorMessage = "Could not save the highlight: \(error.localizedDescription)" + rewriteFilesAfterFailedSave()
             return nil
         }
+        // Saved and journalled: from here on it exists, and ⌘Z removes it.
+        var contextError: Error?
+        do {
+            try writeSelectionContext(snapshot, activeHighlightID: highlight.id)
+        } catch {
+            contextError = error
+        }
+        if registerUndo { registerUndoForCreatedHighlight(highlight.id, actionName: "Highlight") }
+        statusMessage = "Highlight saved · page \(highlight.pageLabel)"
+        if focusComposer {
+            revealInSidebar(highlight.id)
+            requestCommentFocus()
+        }
+        if let contextError {
+            errorMessage = "The highlight was saved, but the agent’s current context could not be updated: \(contextError.localizedDescription)"
+        }
+        return highlight
     }
 
     // MARK: Regions
@@ -391,8 +403,7 @@ final class AppState: ObservableObject {
             // so the agent never sees a region the reader does not.
             highlights.removeAll { $0.id == record.id }
             if selectedHighlightID == record.id { selectedHighlightID = nil }
-            try? persistStateWithoutEvent()
-            errorMessage = "Could not save the region: \(error.localizedDescription)"
+            errorMessage = "Could not save the region: \(error.localizedDescription)" + rewriteFilesAfterFailedSave()
             return nil
         }
         // Saved: from here on the region exists, on disk and on screen, and
@@ -461,8 +472,12 @@ final class AppState: ObservableObject {
                 }
             }
         } catch {
+            // Not saved: out of memory and out of the files, so the agent
+            // cannot answer a comment the user was told was not saved. The
+            // draft is kept. An anchor highlight made for it above was saved
+            // and journalled on its own, so it stays.
             comments.removeAll { $0.id == comment.id }
-            errorMessage = "Could not save the comment: \(error.localizedDescription)"
+            errorMessage = "Could not save the comment: \(error.localizedDescription)" + rewriteFilesAfterFailedSave()
         }
     }
 
@@ -480,26 +495,38 @@ final class AppState: ObservableObject {
 
     /// Replaces a saved comment's text in place, keeping its anchor and ID so
     /// the agent's transcript and reply still point at it.
-    func updateComment(_ id: UUID, verbatim: String) {
+    /// Returns false only when the new text could not be saved, so the
+    /// editor can stay open with it; true when it was saved or there was
+    /// nothing to save.
+    @discardableResult
+    func updateComment(_ id: UUID, verbatim: String) -> Bool {
         let text = verbatim.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let index = comments.firstIndex(where: { $0.id == id }),
               !text.isEmpty,
-              comments[index].verbatim != text else { return }
+              comments[index].verbatim != text else { return true }
         let previous = comments[index].verbatim
         let previousUpdatedAt = comments[index].updatedAt
-        undoManager.registerUndo(withTarget: self) { target in
-            target.updateComment(id, verbatim: previous)
-            target.comments[index].updatedAt = previousUpdatedAt
-        }
-        undoManager.setActionName("Edit Comment")
         comments[index].verbatim = text
         comments[index].updatedAt = Date()
         do {
             try persistState(eventKind: "comment_updated", recordID: id, origin: "typed")
-            statusMessage = "Comment updated"
         } catch {
-            errorMessage = "Could not update the comment: \(error.localizedDescription)"
+            // Not saved: the comment keeps its saved text everywhere, and
+            // there is no edit to undo.
+            comments[index].verbatim = previous
+            comments[index].updatedAt = previousUpdatedAt
+            errorMessage = "Could not update the comment: \(error.localizedDescription)" + rewriteFilesAfterFailedSave()
+            keepUndoEntryAfterFailure(actionName: "Edit Comment") { $0.updateComment(id, verbatim: text) }
+            return false
         }
+        undoManager.registerUndo(withTarget: self) { target in
+            if target.updateComment(id, verbatim: previous) {
+                target.comments[index].updatedAt = previousUpdatedAt
+            }
+        }
+        undoManager.setActionName("Edit Comment")
+        statusMessage = "Comment updated"
+        return true
     }
 
     func saveNotes() {
@@ -540,16 +567,17 @@ final class AppState: ObservableObject {
         let previous = highlights[index].color
         highlights[index].color = color
         let region = highlights[index].isRegion
+        let actionName = region ? "Change Region Color" : "Change Highlight Color"
         do {
             try persistState(eventKind: region ? "region_color_changed" : "highlight_color_changed", recordID: id, origin: "app_action")
             undoManager.registerUndo(withTarget: self) { $0.setHighlightColor(id, color: previous) }
-            undoManager.setActionName(region ? "Change Region Color" : "Change Highlight Color")
+            undoManager.setActionName(actionName)
         } catch {
             highlights[index].color = previous
             // The records may have been written before the journal failed:
             // write them back as they are now, so the files match the page.
-            try? persistStateWithoutEvent()
-            errorMessage = "Could not save the highlight color: \(error.localizedDescription)"
+            errorMessage = "Could not save the highlight color: \(error.localizedDescription)" + rewriteFilesAfterFailedSave()
+            keepUndoEntryAfterFailure(actionName: actionName) { $0.setHighlightColor(id, color: color) }
         }
     }
 
@@ -570,10 +598,7 @@ final class AppState: ObservableObject {
               highlights[index].deletedAt != deletedAt else { return }
         let previousDeletedAt = highlights[index].deletedAt
         let previousComments = comments.filter { $0.highlightID == id }
-        undoManager.registerUndo(withTarget: self) { target in
-            target.applyHighlightDeletion(id, deletedAt: previousDeletedAt, actionName: actionName, restoringComments: previousComments)
-        }
-        undoManager.setActionName(actionName)
+        let before = (highlights: highlights, comments: comments, selectedHighlightID: selectedHighlightID)
         highlights[index].deletedAt = deletedAt
         if let restoringComments {
             for comment in restoringComments {
@@ -586,30 +611,48 @@ final class AppState: ObservableObject {
             }
         }
         if deletedAt != nil, selectedHighlightID == id { selectedHighlightID = nil }
+        let restored = deletedAt == nil
+        let region = highlights[index].isRegion
+        let origin: String
+        if undoManager.isUndoing {
+            origin = "undo"
+        } else if undoManager.isRedoing {
+            origin = "redo"
+        } else {
+            origin = "app_action"
+        }
+        let noun = region ? "region" : "highlight"
         do {
-            let restored = deletedAt == nil
-            let region = highlights[index].isRegion
-            let origin: String
-            if undoManager.isUndoing {
-                origin = "undo"
-            } else if undoManager.isRedoing {
-                origin = "redo"
-            } else {
-                origin = "app_action"
-            }
-            let noun = region ? "region" : "highlight"
             try persistState(
                 eventKind: restored ? "\(noun)_restored" : "\(noun)_deleted",
                 recordID: id,
                 origin: origin
             )
-            try writePageContext()
-            statusMessage = restored
-                ? (region ? "Region restored" : "Highlight restored")
-                : (region ? "Region and linked comments removed · ⌘Z to undo" : "Highlight and linked comments removed · ⌘Z to undo")
         } catch {
-            errorMessage = "Could not update the highlight: \(error.localizedDescription)"
+            // Not saved: the highlight and its comments stay as they were,
+            // in memory and in the files, and there is nothing to undo.
+            highlights = before.highlights
+            comments = before.comments
+            selectedHighlightID = before.selectedHighlightID
+            errorMessage = "Could not update the highlight: \(error.localizedDescription)" + rewriteFilesAfterFailedSave()
+            keepUndoEntryAfterFailure(actionName: actionName) { target in
+                target.applyHighlightDeletion(id, deletedAt: deletedAt, actionName: actionName, restoringComments: restoringComments)
+            }
+            return
         }
+        // Saved and journalled: it happened, and ⌘Z reverses it.
+        undoManager.registerUndo(withTarget: self) { target in
+            target.applyHighlightDeletion(id, deletedAt: previousDeletedAt, actionName: actionName, restoringComments: previousComments)
+        }
+        undoManager.setActionName(actionName)
+        do {
+            try writePageContext()
+        } catch {
+            errorMessage = "The \(noun) was \(restored ? "restored" : "removed"), but the agent’s current context could not be updated: \(error.localizedDescription)"
+        }
+        statusMessage = restored
+            ? (region ? "Region restored" : "Highlight restored")
+            : (region ? "Region and linked comments removed · ⌘Z to undo" : "Highlight and linked comments removed · ⌘Z to undo")
     }
 
     func deleteComment(_ id: UUID) {
@@ -627,20 +670,11 @@ final class AppState: ObservableObject {
               comments[index].status != status else { return }
         let previousStatus = comments[index].status
         let previousUpdatedAt = comments[index].updatedAt
-        undoManager.registerUndo(withTarget: self) { target in
-            target.applyCommentState(
-                id,
-                status: previousStatus,
-                updatedAt: previousUpdatedAt,
-                actionName: actionName
-            )
-        }
-        undoManager.setActionName(actionName)
         comments[index].status = status
         comments[index].updatedAt = updatedAt
 
+        let restored = status != "deleted"
         do {
-            let restored = status != "deleted"
             let origin: String
             if undoManager.isUndoing {
                 origin = "undo"
@@ -654,12 +688,29 @@ final class AppState: ObservableObject {
                 recordID: id,
                 origin: origin
             )
-            statusMessage = restored
-                ? "Comment restored"
-                : "Comment deleted · ⌘Z to undo"
         } catch {
-            errorMessage = "Could not update the comment: \(error.localizedDescription)"
+            // Not saved: the comment stays as it was, in memory and in the
+            // files the agent watches, and there is nothing to undo.
+            comments[index].status = previousStatus
+            comments[index].updatedAt = previousUpdatedAt
+            errorMessage = "Could not update the comment: \(error.localizedDescription)" + rewriteFilesAfterFailedSave()
+            keepUndoEntryAfterFailure(actionName: actionName) { target in
+                target.applyCommentState(id, status: status, updatedAt: updatedAt, actionName: actionName)
+            }
+            return
         }
+        undoManager.registerUndo(withTarget: self) { target in
+            target.applyCommentState(
+                id,
+                status: previousStatus,
+                updatedAt: previousUpdatedAt,
+                actionName: actionName
+            )
+        }
+        undoManager.setActionName(actionName)
+        statusMessage = restored
+            ? "Comment restored"
+            : "Comment deleted · ⌘Z to undo"
     }
 
     func performUndo() {
@@ -667,6 +718,7 @@ final class AppState: ObservableObject {
             textUndoManager.undo()
         } else if undoManager.canUndo {
             undoManager.undo()
+            completeUndoBounce()
         }
     }
 
@@ -675,6 +727,7 @@ final class AppState: ObservableObject {
             textUndoManager.redo()
         } else if undoManager.canRedo {
             undoManager.redo()
+            completeUndoBounce()
         }
     }
 
@@ -763,7 +816,11 @@ final class AppState: ObservableObject {
         }
         if let selectedCommentID {
             deleteComment(selectedCommentID)
-            self.selectedCommentID = nil
+            // A comment whose deletion could not be saved is still there,
+            // and stays selected.
+            if !comments.contains(where: { $0.id == selectedCommentID && $0.status != "deleted" }) {
+                self.selectedCommentID = nil
+            }
             return true
         }
         return false
@@ -956,6 +1013,8 @@ final class AppState: ObservableObject {
         guard var manifest, let paths = sessionPaths else { return }
         manifest.updatedAt = Date()
         manifest.lastPageIndex = currentPageIndex
+        // Kept equal to what `saveState` writes for these records.
+        manifest.schemaVersion = SessionRepository.schemaVersion(for: highlights)
         self.manifest = manifest
         try repository.saveState(
             manifest: manifest,
@@ -1029,6 +1088,7 @@ final class AppState: ObservableObject {
         guard var manifest, let paths = sessionPaths else { return }
         manifest.updatedAt = Date()
         manifest.lastPageIndex = currentPageIndex
+        manifest.schemaVersion = SessionRepository.schemaVersion(for: highlights)
         self.manifest = manifest
         try repository.saveState(
             manifest: manifest,
@@ -1037,6 +1097,62 @@ final class AppState: ObservableObject {
             notes: notes,
             paths: paths
         )
+    }
+
+    /// After a save that failed, once the caller has put memory back: writes
+    /// the records again to match it, in case they reached disk and only the
+    /// journal failed, so the agent never acts on something the user was told
+    /// did not happen. Returns what to add to the error when this write fails
+    /// too, so that is reported rather than hidden.
+    private func rewriteFilesAfterFailedSave() -> String {
+        do {
+            try persistStateWithoutEvent()
+            return ""
+        } catch {
+            return " The session files could not be put back to match either (\(error.localizedDescription)); they may show the change until the next successful save."
+        }
+    }
+
+    private enum UndoBounce { case undo, redo }
+    /// Set by a failed undo or redo; performed as soon as the undo manager
+    /// has finished it. See `keepUndoEntryAfterFailure`.
+    private var pendingUndoBounce: (manager: UndoManager, step: UndoBounce, token: String)?
+
+    /// A failed undo or redo changed nothing, so both stacks must end as they
+    /// were. The undo manager has already taken the entry off its stack, and
+    /// a plain registration would put it back only by clearing the redo
+    /// stack. Instead a one-off "bounce" entry goes on the opposite stack
+    /// (where registrations land during an undo or redo), and is performed at
+    /// once: performing it is itself a redo (or undo), during which the
+    /// failed entry is registered again on the stack it came from without
+    /// touching the other one. `repeatCall` is the call that failed.
+    private func keepUndoEntryAfterFailure(actionName: String, _ repeatCall: @escaping (AppState) -> Void) {
+        let manager = undoManager
+        guard manager.isUndoing || manager.isRedoing else { return }
+        let step: UndoBounce = manager.isUndoing ? .redo : .undo
+        manager.registerUndo(withTarget: self) { target in
+            manager.registerUndo(withTarget: target, handler: repeatCall)
+            manager.setActionName(actionName)
+        }
+        // A name no real action has, so the bounce is performed only while
+        // it is still the top entry. Never shown: it is gone before the menu
+        // can be read.
+        let token = "Paper Companion undo bounce \(UUID().uuidString)"
+        manager.setActionName(token)
+        pendingUndoBounce = (manager, step, token)
+        // ⌘Z and ⇧⌘Z complete it at once (`performUndo`, `performRedo`);
+        // this covers an undo started some other way.
+        Task { @MainActor [weak self] in self?.completeUndoBounce() }
+    }
+
+    private func completeUndoBounce() {
+        guard let (manager, step, token) = pendingUndoBounce else { return }
+        pendingUndoBounce = nil
+        guard !manager.isUndoing, !manager.isRedoing else { return }
+        switch step {
+        case .redo: if manager.canRedo, manager.redoActionName == token { manager.redo() }
+        case .undo: if manager.canUndo, manager.undoActionName == token { manager.undo() }
+        }
     }
 
     private func schedulePagePositionSave() {

@@ -1,5 +1,12 @@
 import Foundation
 
+/// Writes `comments.md` and `bridge/current-context.md`, which the agent reads.
+///
+/// Text that comes from the PDF (quotes, selections, surrounding text, page
+/// labels, the title from its metadata) is never allowed to look like
+/// structure the app wrote: labels and the title are flattened onto the line
+/// that uses them, and longer text goes in a block quote it cannot leave. The
+/// user's own comment text is written exactly as he typed it.
 public enum MarkdownExporter {
     public static func renderComments(
         title: String,
@@ -7,7 +14,7 @@ public enum MarkdownExporter {
         comments: [CommentRecord]
     ) -> String {
         var lines = [
-            "# Reading comments: \(escapeHeading(title))",
+            "# Reading comments: \(oneLine(title))",
             "",
             "Generated from Paper Companion sidecar records. The original PDF is not modified.",
             ""
@@ -26,7 +33,7 @@ public enum MarkdownExporter {
             if highlight.isRegion {
                 lines.append(contentsOf: regionSection(highlight))
             } else {
-                lines.append("## Page \(highlight.pageLabel) · Highlight `\(highlight.id.uuidString)`")
+                lines.append("## Page \(oneLine(highlight.pageLabel)) · Highlight `\(highlight.id.uuidString)`")
                 lines.append("")
                 lines.append(contentsOf: blockquote(highlight.quote))
                 lines.append("")
@@ -59,7 +66,7 @@ public enum MarkdownExporter {
             lines.append("## Standalone and orphaned comments")
             lines.append("")
             for comment in standalone {
-                let page = comment.pageLabel.map { " · Page \($0)" } ?? ""
+                let page = comment.pageLabel.map { " · Page \(oneLine($0))" } ?? ""
                 lines.append("### \(label(for: comment)) `\(comment.id.uuidString)`\(page)")
                 lines.append("")
                 if let highlightID = comment.highlightID {
@@ -114,12 +121,12 @@ public enum MarkdownExporter {
         if !context.prefix.isEmpty || !context.suffix.isEmpty {
             lines.append("## Bounded surrounding text")
             lines.append("")
+            // Page text straight from the PDF: quoted so it cannot pass for
+            // the app's own structure.
             if context.activeRegion != nil {
-                // Page text around a region, straight from the PDF: quoted so
-                // it cannot pass for the app's own structure.
-                lines.append(contentsOf: literalQuote(context.prefix + context.suffix))
+                lines.append(contentsOf: blockquote(context.prefix + context.suffix))
             } else {
-                lines.append(context.prefix + (context.selectedText ?? "") + context.suffix)
+                lines.append(contentsOf: blockquote(context.prefix + (context.selectedText ?? "") + context.suffix))
             }
             lines.append("")
         }
@@ -168,7 +175,7 @@ public enum MarkdownExporter {
         if let caption = region.captionGuess, !caption.isEmpty {
             lines.append("Caption (guess, nearest caption-like line on the page; verify):")
             lines.append("")
-            lines.append(contentsOf: literalQuote(caption))
+            lines.append(contentsOf: blockquote(caption))
         } else {
             lines.append("Caption (guess): none found on the page.")
         }
@@ -178,7 +185,7 @@ public enum MarkdownExporter {
         } else {
             lines.append("Text inside the box (verbatim, from the PDF's text layer):")
             lines.append("")
-            lines.append(contentsOf: literalQuote(region.textInRegion))
+            lines.append(contentsOf: blockquote(region.textInRegion))
         }
         lines.append("")
         return lines
@@ -189,7 +196,7 @@ public enum MarkdownExporter {
     /// `\r`, and other readers at U+2028, U+2029, U+0085, vertical tab and
     /// form feed), and every line prefixed. A line that starts with `#`, `>`,
     /// a fence or an HTML tag stays inside the quote.
-    private static func literalQuote(_ text: String) -> [String] {
+    private static func blockquote(_ text: String) -> [String] {
         var lines: [String] = []
         var current = ""
         for character in text {
@@ -215,13 +222,5 @@ public enum MarkdownExporter {
 
     private static func label(for comment: CommentRecord) -> String {
         comment.kind == .quiet ? "Margin note" : "Comment"
-    }
-
-    private static func blockquote(_ text: String) -> [String] {
-        text.split(separator: "\n", omittingEmptySubsequences: false).map { "> \($0)" }
-    }
-
-    private static func escapeHeading(_ text: String) -> String {
-        text.replacingOccurrences(of: "\n", with: " ")
     }
 }

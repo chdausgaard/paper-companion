@@ -93,6 +93,12 @@ final class HighlightInteractionTests: XCTestCase {
         harness.annotations()[id]?.first?.color.alphaComponent
     }
 
+    /// Whether the highlight is drawn at `value`, for waiting on hover.
+    @MainActor
+    private func drawn(_ id: UUID, at value: CGFloat, in harness: ReaderHarness) -> Bool {
+        alpha(of: id, in: harness).map { abs($0 - value) < 0.001 } ?? false
+    }
+
     private func cursorName(_ cursor: NSCursor) -> String {
         switch cursor {
         case NSCursor.pointingHand: return "pointing hand"
@@ -539,6 +545,7 @@ final class HighlightInteractionTests: XCTestCase {
         let bravo = ids[1]
         hover.cardHoverChanged(bravo, isHovering: true)
         spin(AnnotationHover.cardHoverDelay + 0.2)
+        waitUntil { hover.cardHoveredID == bravo && drawn(bravo, at: 0.57, in: harness) }
         XCTAssertEqual(try XCTUnwrap(alpha(of: bravo, in: harness)), 0.57, accuracy: 0.001)
 
         state.deleteHighlight(bravo)
@@ -549,6 +556,7 @@ final class HighlightInteractionTests: XCTestCase {
         spin(0.03)
         hover.cardHoverChanged(bravo, isHovering: true)    // and is back under it
         spin(AnnotationHover.cardHoverDelay + 0.2)
+        waitUntil { hover.cardHoveredID == bravo && drawn(bravo, at: 0.57, in: harness) }
         XCTAssertEqual(hover.cardHoveredID, bravo)
         XCTAssertEqual(try XCTUnwrap(alpha(of: bravo, in: harness)), 0.57, accuracy: 0.001, "the restored highlight is lit")
         XCTAssertEqual(try XCTUnwrap(alpha(of: ids[0], in: harness)), 0.42, accuracy: 0.001)
@@ -637,6 +645,7 @@ final class HighlightInteractionTests: XCTestCase {
         hover.cardHoverChanged(ids[3], isHovering: true)
         XCTAssertEqual(drawn(harness), baseline, "nothing lit while the pointer is still passing")
         spin(AnnotationHover.cardHoverDelay + 0.2)
+        waitUntil { hover.cardHoveredID == ids[3] && drawn(ids[3], at: 0.57, in: harness) }
         XCTAssertEqual(recorder.calls, 1, "one change, where the pointer stopped")
         XCTAssertEqual(hover.cardHoveredID, ids[3])
         XCTAssertEqual(try XCTUnwrap(alpha(of: ids[3], in: harness)), 0.57, accuracy: 0.001)
@@ -647,6 +656,7 @@ final class HighlightInteractionTests: XCTestCase {
         // Leaving the card: the highlight goes back after the same rest.
         hover.cardHoverChanged(ids[3], isHovering: false)
         spin(AnnotationHover.cardHoverDelay + 0.2)
+        waitUntil { hover.cardHoveredID == nil && drawn(ids[3], at: 0.42, in: harness) }
         XCTAssertNil(hover.cardHoveredID)
         XCTAssertEqual(try XCTUnwrap(alpha(of: ids[3], in: harness)), 0.42, accuracy: 0.001)
         for id in ids.prefix(3) { XCTAssertEqual(drawn(harness)[id], baseline[id], "never restyled") }
@@ -671,13 +681,21 @@ final class HighlightInteractionTests: XCTestCase {
         pointer(.mouseEntered, atWindowPoint: onBravo, trackedBy: owner)
         pointer(.mouseMoved, atWindowPoint: onBravo, trackedBy: owner)
         XCTAssertEqual(drawn(harness), baseline, "not before the rest")
+        // The page follows after the card-hover debounce: at least that long,
+        // then until it shows (on a busy machine it can take longer).
         spin(AnnotationHover.cardHoverDelay + 0.3)
+        waitForHover(redeliver: { pointer(.mouseMoved, atWindowPoint: onBravo, trackedBy: owner) }) {
+            harness.state.annotationHover.cardHoveredID == ids[1] && drawn(ids[1], at: 0.57, in: harness)
+        }
         XCTAssertEqual(harness.state.annotationHover.cardHoveredID, ids[1], "the pointer on bravo's card lights bravo")
         XCTAssertEqual(try XCTUnwrap(alpha(of: ids[1], in: harness)), 0.57, accuracy: 0.001)
         XCTAssertEqual(drawn(harness)[ids[0]], baseline[ids[0]], "alpha untouched")
 
         pointer(.mouseExited, atWindowPoint: onBravo, trackedBy: owner)
         spin(AnnotationHover.cardHoverDelay + 0.3)
+        waitForHover(redeliver: { pointer(.mouseExited, atWindowPoint: onBravo, trackedBy: owner) }) {
+            harness.state.annotationHover.cardHoveredID == nil && drawn(ids[1], at: 0.42, in: harness)
+        }
         XCTAssertNil(harness.state.annotationHover.cardHoveredID)
         XCTAssertEqual(try XCTUnwrap(alpha(of: ids[1], in: harness)), 0.42, accuracy: 0.001, "leaving the card puts the page back")
         XCTAssertEqual(drawn(harness)[ids[0]], baseline[ids[0]], "alpha never restyled")
