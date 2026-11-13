@@ -218,6 +218,115 @@ final class PDFSnapshotTests: XCTestCase {
         return (luminance + 0.05) / 0.05
     }
 
+    // MARK: Regions
+
+    private enum RegionLook: String, CaseIterable {
+        case normal = "08-region-normal"
+        case hovered = "09-region-hovered"
+        case selected = "10-region-selected"
+        case liveDrag = "11-region-live-drag"
+    }
+
+    /// A page with a figure boxed as a region next to a text highlight: at
+    /// rest, with the pointer on it (a real mouse-moved event), selected as
+    /// a click selects it, and a second box mid-drag with the tool (real
+    /// mouse-down and mouse-dragged events, the button still down).
+    @MainActor
+    private func renderRegion(_ look: RegionLook) throws {
+        let directory = try SnapshotOutput.directory()
+        for dark in [false, true] {
+            let appearance = try XCTUnwrap(NSAppearance(named: dark ? .darkAqua : .aqua))
+            let session = try RegionTestSession()
+            defer { session.remove() }
+            let state = session.state
+            let harness = try ReaderHarness(test: self, state: state, appearance: appearance)
+            defer { harness.close(self) }
+            let page = try XCTUnwrap(harness.pdfView.document?.page(at: 0))
+            _ = try harness.highlight("Treated places", color: "green", test: self)
+            let region = try XCTUnwrap(state.createRegion(on: page, rect: FigurePDF.figure))
+            state.commentDraft = "Is the 2015 bar the reform year?"
+            state.saveCommentFromKeyboard()
+            state.clearEntrySelection()
+            spin(0.5)
+            harness.window.makeFirstResponder(harness.pdfView)
+            let inside = harness.windowPoint(NSPoint(x: FigurePDF.figure.minX + 6, y: FigurePDF.figure.maxY - 6), on: page)
+
+            switch look {
+            case .normal:
+                break
+            case .hovered:
+                moveMouse(toWindowPoint: inside, in: harness.window)
+                XCTAssertEqual(harness.pdfView.hoveredAnnotationID, region.id)
+            case .selected:
+                state.highlightClicked(region.id)
+            case .liveDrag:
+                state.regionToolActive = true
+                spin(0.2)
+                let start = harness.windowPoint(NSPoint(x: 352, y: 280), on: page)
+                let end = harness.windowPoint(NSPoint(x: 476, y: 190), on: page)
+                let hit = try XCTUnwrap(hitView(atWindowPoint: start, in: harness.window))
+                withFirstMouseAccepted(by: [type(of: hit)]) {
+                    harness.window.sendEvent(mouseEvent(.leftMouseDown, at: start, in: harness.window))
+                    harness.window.sendEvent(mouseEvent(.leftMouseDragged, at: NSPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2), in: harness.window))
+                    harness.window.sendEvent(mouseEvent(.leftMouseDragged, at: end, in: harness.window))
+                }
+                XCTAssertNotNil(harness.pdfView.regionDrag, "mid-drag")
+            }
+            spin(0.5)
+            harness.host.layoutSubtreeIfNeeded()
+
+            let rect = NSRect(x: 0, y: 0, width: ReaderHarness.pdfWidth, height: harness.host.bounds.height)
+            let url = directory.appendingPathComponent("\(look.rawValue)-\(dark ? "dark" : "light").png")
+            let image = try SnapshotOutput.readerBitmap(of: harness.host, pdfView: harness.pdfView, appearance: appearance, rect: rect)
+            XCTAssertGreaterThan(try SnapshotOutput.writePNG(image, to: url), 10_000, "\(url.lastPathComponent) looks blank")
+            if look == .liveDrag {
+                harness.window.sendEvent(mouseEvent(.leftMouseUp, at: harness.windowPoint(NSPoint(x: 476, y: 190), on: page), in: harness.window))
+                spin(0.2)
+            }
+            if look == .normal, !dark {
+                // The two pictures the agent gets, next to the page PNGs.
+                for (source, name) in [(session.paths.regionImage(of: region), "12-region-crop-for-agent.png"),
+                                       (session.paths.regionPageImage(of: region), "13-region-page-for-agent.png")] {
+                    let file = try XCTUnwrap(source)
+                    let target = directory.appendingPathComponent(name)
+                    try? FileManager.default.removeItem(at: target)
+                    try FileManager.default.copyItem(at: file, to: target)
+                }
+            }
+        }
+    }
+
+    /// The figure page turned a quarter turn, with its crop box moved off the
+    /// origin, and the chart boxed: the outline must sit on the chart.
+    @MainActor
+    func testSnapshotRegionOnRotatedPage() throws {
+        let directory = try SnapshotOutput.directory()
+        let appearance = try XCTUnwrap(NSAppearance(named: .aqua))
+        let session = try RegionTestSession()
+        defer { session.remove() }
+        let page = try XCTUnwrap(session.document.page(at: 0))
+        page.setBounds(CGRect(x: 20, y: 30, width: 470, height: 380), for: .cropBox)
+        page.rotation = 90
+        let harness = try ReaderHarness(test: self, state: session.state, appearance: appearance)
+        defer { harness.close(self) }
+        let region = try XCTUnwrap(session.state.createRegion(on: page, rect: FigurePDF.figure))
+        session.state.clearEntrySelection()
+        spin(0.6)
+        XCTAssertNotNil(harness.annotations()[region.id])
+        let rect = NSRect(x: 0, y: 0, width: ReaderHarness.pdfWidth, height: harness.host.bounds.height)
+        let image = try SnapshotOutput.readerBitmap(of: harness.host, pdfView: harness.pdfView, appearance: appearance, rect: rect)
+        XCTAssertGreaterThan(try SnapshotOutput.writePNG(image, to: directory.appendingPathComponent("14-region-rotated-page-light.png")), 10_000)
+        let crop = try XCTUnwrap(session.paths.regionImage(of: region))
+        let target = directory.appendingPathComponent("15-region-rotated-crop-for-agent.png")
+        try? FileManager.default.removeItem(at: target)
+        try FileManager.default.copyItem(at: crop, to: target)
+    }
+
+    @MainActor func testSnapshotRegionNormal() throws { try renderRegion(.normal) }
+    @MainActor func testSnapshotRegionHovered() throws { try renderRegion(.hovered) }
+    @MainActor func testSnapshotRegionSelected() throws { try renderRegion(.selected) }
+    @MainActor func testSnapshotRegionLiveDrag() throws { try renderRegion(.liveDrag) }
+
     @MainActor func testSnapshotPDFNormal() throws { try render(.normal) }
     @MainActor func testSnapshotPDFHovered() throws { try render(.hovered) }
     @MainActor func testSnapshotPDFSelected() throws { try render(.selected) }

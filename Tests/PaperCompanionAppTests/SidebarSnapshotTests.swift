@@ -205,6 +205,86 @@ final class SidebarSnapshotTests: XCTestCase {
         }
     }
 
+    // MARK: Regions
+
+    /// The seed plus three regions drawn on the figure paper with their real
+    /// pictures in a temporary session: the chart with a comment and an
+    /// agent reply, the note beside it with no comment (so its caption
+    /// guess shows), and a box on page 2, where there is no caption.
+    @MainActor
+    private func regionSeed() throws -> (AppState, RegionTestSession, chart: HighlightRecord, side: HighlightRecord, bare: HighlightRecord) {
+        let session = try RegionTestSession()
+        regionSessions.append(session)
+        let seed = Self.seed()
+        let state = seed.state
+        state.sessionPaths = session.paths
+        func region(page index: Int, _ rect: CGRect, color: String, at seconds: TimeInterval) throws -> HighlightRecord {
+            let page = try XCTUnwrap(session.document.page(at: index))
+            let record = try XCTUnwrap(RegionSnapshot.makeRecord(page: page, rect: rect, color: color, createdAt: Date(timeIntervalSince1970: seconds)))
+            try RegionSnapshot.writeImages(for: record, page: page, paths: session.paths)
+            return record
+        }
+        let chart = try region(page: 0, FigurePDF.figure, color: "yellow", at: 1)
+        let side = try region(page: 0, CGRect(x: 352, y: 190, width: 124, height: 92), color: "blue", at: 2)
+        let bare = try region(page: 1, CGRect(x: 36, y: 330, width: 300, height: 56), color: "purple", at: 3)
+        state.highlights = [chart, side, bare] + state.highlights
+        let comment = CommentRecord(highlightID: chart.id, pageIndex: 0, pageLabel: "1",
+                                    verbatim: "Is the 2015 bar the reform year? The text says the gap opened after the reform.",
+                                    createdAt: Date(timeIntervalSince1970: 4))
+        state.comments.append(comment)
+        state.agentReplies[comment.id] = "The rollout started in 2009; the reform is the 2013 bar. The jump to 2015 is the first election after it."
+        return (state, session, chart, side, bare)
+    }
+
+    private var regionSessions: [RegionTestSession] = []
+
+    /// The pictures load off the main thread once the cards appear; the
+    /// PNGs are taken after they arrived.
+    @MainActor
+    private func waitForRegionPictures(_ state: AppState) {
+        spin(0.2)
+        let deadline = Date().addingTimeInterval(5)
+        while RegionImageCache.isLoading, Date() < deadline { spin(0.05) }
+        XCTAssertFalse(RegionImageCache.isLoading, "the region pictures loaded")
+    }
+
+    override func tearDown() {
+        MainActor.assumeIsolated {
+            for session in regionSessions { session.remove() }
+            regionSessions = []
+        }
+        super.tearDown()
+    }
+
+    @MainActor
+    func testSnapshotRegionCards() throws {
+        try render("10-region-cards", {
+            let seed = try! regionSeed()
+            return (seed.0, sidebar(seed.0))
+        }, prepare: waitForRegionPictures)
+    }
+
+    /// The commented region expanded: its larger picture, the comment and
+    /// the reply; the composer's chip names the region.
+    @MainActor
+    func testSnapshotRegionExpandedAndComposerChip() throws {
+        try render("11-region-expanded-chip", {
+            let seed = try! regionSeed()
+            seed.0.selectedHighlightID = seed.chart.id
+            return (seed.0, sidebar(seed.0))
+        }, prepare: waitForRegionPictures)
+    }
+
+    /// A region with no comment expanded, hovered: its picture and caption.
+    @MainActor
+    func testSnapshotRegionWithoutCommentExpanded() throws {
+        try render("12-region-no-comment-expanded", {
+            let seed = try! regionSeed()
+            seed.0.selectedHighlightID = seed.side.id
+            return (seed.0, sidebar(seed.0, overrides: [seed.side.id: .hovered]))
+        }, prepare: waitForRegionPictures)
+    }
+
     /// A highlight just made with ⇧⌘H: the comment box has the keyboard and
     /// its chip names the new highlight.
     @MainActor

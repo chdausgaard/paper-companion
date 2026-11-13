@@ -62,6 +62,14 @@ struct ContentView: View {
                 .disabled(state.currentSelection == nil)
                 .help("Highlight the selected PDF text (⇧⌘H)")
 
+                Toggle(isOn: $state.regionToolActive) {
+                    Label("Comment on Region", systemImage: "rectangle.dashed")
+                }
+                .toggleStyle(.button)
+                // Not while the library shows: there is no page to draw on.
+                .disabled(!state.canUseRegionTool)
+                .help("Drag a box over a figure, table or any area of a page to comment on it (⇧⌘R). Esc cancels.")
+
                 Toggle(isOn: $state.autoHighlightEnabled) {
                     Label("Auto Highlight", systemImage: "cursorarrow.motionlines")
                 }

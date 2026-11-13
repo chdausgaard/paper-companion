@@ -59,6 +59,36 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Comment on Region (⇧⌘R): while on, a drag on a page draws a box to
+    /// comment on instead of selecting text. It turns itself off after one
+    /// box, on Esc, and when the document changes.
+    @Published var regionToolActive = false {
+        didSet {
+            guard regionToolActive != oldValue, regionToolActive else { return }
+            // Armed with no reader on screen, Esc would have nothing to
+            // cancel it and the reader would come back armed.
+            guard canUseRegionTool else {
+                regionToolActive = false
+                return
+            }
+            statusMessage = "Drag a box over a figure, table or any area to comment on it · Esc cancels"
+        }
+    }
+    /// The PDF reader is in a window (not replaced by the library, its
+    /// window not closed). Reported by the reader itself.
+    @Published private(set) var readerOnScreen = false
+
+    /// The region tool needs a paper and the reader showing it.
+    var canUseRegionTool: Bool { document != nil && readerOnScreen }
+
+    func readerOnScreenChanged(_ onScreen: Bool) {
+        guard readerOnScreen != onScreen else { return }
+        readerOnScreen = onScreen
+        if !onScreen, regionToolActive { regionToolActive = false }
+    }
+    /// The color a new region gets, like a new highlight's.
+    static let newRegionColor = HighlightColor.yellow
+
     var undoManager = UndoManager()
     /// Pointer hover linking the PDF page and the cards. Deliberately not
     /// `@Published`: see `AnnotationHover`.
@@ -151,6 +181,7 @@ final class AppState: ObservableObject {
                 extractedText: extractedText
             )
             undoManager.removeAllActions()
+            regionToolActive = false
             sourceURL = url
             document = pdfDocument
             manifest = loaded.manifest
@@ -270,7 +301,7 @@ final class AppState: ObservableObject {
         focusComposer: Bool = false
     ) -> HighlightRecord? {
         if let existing = activeHighlights.last(where: {
-            $0.quote == snapshot.selectedText && $0.locations == snapshot.locations
+            !$0.isRegion && $0.quote == snapshot.selectedText && $0.locations == snapshot.locations
         }) {
             selectedHighlightID = existing.id
             statusMessage = "This selection is already highlighted · page \(existing.pageLabel)"
@@ -288,7 +319,7 @@ final class AppState: ObservableObject {
         do {
             try persistState(eventKind: "highlight_created", recordID: highlight.id, origin: origin)
             try writeSelectionContext(snapshot, activeHighlightID: highlight.id)
-            if registerUndo { registerUndoForCreatedHighlight(highlight.id) }
+            if registerUndo { registerUndoForCreatedHighlight(highlight.id, actionName: "Highlight") }
             statusMessage = "Highlight saved · page \(highlight.pageLabel)"
             if focusComposer {
                 revealInSidebar(highlight.id)
@@ -301,6 +332,81 @@ final class AppState: ObservableObject {
             errorMessage = "Could not save the highlight: \(error.localizedDescription)"
             return nil
         }
+    }
+
+    // MARK: Regions
+
+    /// The region tool ended without a box (Esc, or the reader left).
+    func regionToolCancelled() {
+        guard regionToolActive else { return }
+        regionToolActive = false
+        statusMessage = "Comment on Region cancelled"
+    }
+
+    /// A box drawn with the region tool. The tool is one-shot: it is off
+    /// whether or not the box is kept.
+    @discardableResult
+    func regionDrawn(on page: PDFPage, rect: CGRect) -> HighlightRecord? {
+        regionToolActive = false
+        return createRegion(on: page, rect: rect)
+    }
+
+    /// Saves a box on `page` (page space) as a region: its two pictures for
+    /// the agent first, then the record. A region whose pictures could not be
+    /// written is not created, because the agent could not see what it is
+    /// about. Selects it and puts the cursor in the comment box, like a new
+    /// highlight.
+    @discardableResult
+    func createRegion(on page: PDFPage, rect: CGRect) -> HighlightRecord? {
+        guard let document, page.document === document else { return nil }
+        guard let record = RegionSnapshot.makeRecord(page: page, rect: rect, color: Self.newRegionColor.rawValue) else {
+            statusMessage = "No region saved: the box was too small · ⇧⌘R to draw another"
+            return nil
+        }
+        if let existing = activeHighlights.last(where: { $0.isRegion && $0.locations == record.locations }) {
+            selectHighlight(existing, navigate: false)
+            revealInSidebar(existing.id)
+            statusMessage = "This box is already a region · page \(existing.pageLabel)"
+            return existing
+        }
+        guard let paths = sessionPaths else {
+            errorMessage = "Could not save the region: no reading session is open."
+            return nil
+        }
+        do {
+            try RegionSnapshot.writeImages(for: record, page: page, paths: paths)
+        } catch {
+            errorMessage = "Could not save the region: its pictures for the agent could not be written to the session’s regions folder (\(error.localizedDescription)). Nothing was added; draw the box again once the folder can be written."
+            statusMessage = "Region not saved"
+            return nil
+        }
+        highlights.append(record)
+        selectedHighlightID = record.id
+        selectedCommentID = nil
+        do {
+            try persistState(eventKind: "region_created", recordID: record.id, origin: "region_tool")
+        } catch {
+            // Not saved: take it back out of memory, and out of the files too,
+            // in case the records were written and only the journal failed,
+            // so the agent never sees a region the reader does not.
+            highlights.removeAll { $0.id == record.id }
+            if selectedHighlightID == record.id { selectedHighlightID = nil }
+            try? persistStateWithoutEvent()
+            errorMessage = "Could not save the region: \(error.localizedDescription)"
+            return nil
+        }
+        // Saved: from here on the region exists, on disk and on screen, and
+        // ⌘Z is what removes it.
+        registerUndoForCreatedHighlight(record.id, actionName: "Region")
+        statusMessage = "Region saved · page \(record.pageLabel) · type a comment, or leave it for later"
+        revealInSidebar(record.id)
+        requestCommentFocus()
+        do {
+            try writeContext(anchorContext(for: record))
+        } catch {
+            errorMessage = "The region was saved, but the agent’s current context could not be updated: \(error.localizedDescription)"
+        }
+        return record
     }
 
     func addComment(linkToHighlight: Bool, kind: CommentRecord.Kind = .discuss) {
@@ -346,9 +452,13 @@ final class AppState: ObservableObject {
             if kind == .quiet {
                 statusMessage = "Margin note saved · page \(comment.pageLabel ?? currentPageLabel) · not sent to the agent"
             } else {
-                statusMessage = linkedHighlight == nil
-                    ? "Page-only comment saved · visible under Saved comments"
-                    : "Comment linked to highlighted text · visible under Saved comments"
+                if linkedHighlight == nil {
+                    statusMessage = "Page-only comment saved · visible under Saved comments"
+                } else if linkedHighlight?.isRegion == true {
+                    statusMessage = "Comment linked to the region · visible under Saved comments"
+                } else {
+                    statusMessage = "Comment linked to highlighted text · visible under Saved comments"
+                }
             }
         } catch {
             comments.removeAll { $0.id == comment.id }
@@ -416,7 +526,11 @@ final class AppState: ObservableObject {
 
     func deleteHighlight(_ id: UUID) {
         NSApplication.shared.keyWindow?.makeFirstResponder(nil)
-        applyHighlightDeletion(id, deletedAt: Date(), actionName: "Remove Highlight")
+        applyHighlightDeletion(id, deletedAt: Date(), actionName: isRegion(id) ? "Remove Region" : "Remove Highlight")
+    }
+
+    private func isRegion(_ id: UUID) -> Bool {
+        highlights.first { $0.id == id }?.isRegion ?? false
     }
 
     func setHighlightColor(_ id: UUID, color: String) {
@@ -425,12 +539,16 @@ final class AppState: ObservableObject {
               highlights[index].color != color else { return }
         let previous = highlights[index].color
         highlights[index].color = color
+        let region = highlights[index].isRegion
         do {
-            try persistState(eventKind: "highlight_color_changed", recordID: id, origin: "app_action")
+            try persistState(eventKind: region ? "region_color_changed" : "highlight_color_changed", recordID: id, origin: "app_action")
             undoManager.registerUndo(withTarget: self) { $0.setHighlightColor(id, color: previous) }
-            undoManager.setActionName("Change Highlight Color")
+            undoManager.setActionName(region ? "Change Region Color" : "Change Highlight Color")
         } catch {
             highlights[index].color = previous
+            // The records may have been written before the journal failed:
+            // write them back as they are now, so the files match the page.
+            try? persistStateWithoutEvent()
             errorMessage = "Could not save the highlight color: \(error.localizedDescription)"
         }
     }
@@ -440,11 +558,11 @@ final class AppState: ObservableObject {
         deleteHighlight(selectedHighlightID)
     }
 
-    private func registerUndoForCreatedHighlight(_ id: UUID) {
+    private func registerUndoForCreatedHighlight(_ id: UUID, actionName: String) {
         undoManager.registerUndo(withTarget: self) { target in
-            target.applyHighlightDeletion(id, deletedAt: Date(), actionName: "Highlight")
+            target.applyHighlightDeletion(id, deletedAt: Date(), actionName: actionName)
         }
-        undoManager.setActionName("Highlight")
+        undoManager.setActionName(actionName)
     }
 
     private func applyHighlightDeletion(_ id: UUID, deletedAt: Date?, actionName: String, restoringComments: [CommentRecord]? = nil) {
@@ -470,6 +588,7 @@ final class AppState: ObservableObject {
         if deletedAt != nil, selectedHighlightID == id { selectedHighlightID = nil }
         do {
             let restored = deletedAt == nil
+            let region = highlights[index].isRegion
             let origin: String
             if undoManager.isUndoing {
                 origin = "undo"
@@ -478,15 +597,16 @@ final class AppState: ObservableObject {
             } else {
                 origin = "app_action"
             }
+            let noun = region ? "region" : "highlight"
             try persistState(
-                eventKind: restored ? "highlight_restored" : "highlight_deleted",
+                eventKind: restored ? "\(noun)_restored" : "\(noun)_deleted",
                 recordID: id,
                 origin: origin
             )
             try writePageContext()
             statusMessage = restored
-                ? "Highlight restored"
-                : "Highlight and linked comments removed · ⌘Z to undo"
+                ? (region ? "Region restored" : "Highlight restored")
+                : (region ? "Region and linked comments removed · ⌘Z to undo" : "Highlight and linked comments removed · ⌘Z to undo")
         } catch {
             errorMessage = "Could not update the highlight: \(error.localizedDescription)"
         }
@@ -572,25 +692,34 @@ final class AppState: ObservableObject {
             navigationRequestID = UUID()
         }
         do {
-            let context = CurrentContext(
-                sessionID: manifest?.id ?? UUID(),
-                sourcePDFPath: manifest?.sourcePDFPath ?? "",
-                sourcePDFFingerprint: manifest?.sourcePDFFingerprint ?? "",
-                pageIndex: highlight.pageIndex,
-                pageLabel: highlight.pageLabel,
-                selectedText: highlight.quote,
-                prefix: highlight.prefix,
-                suffix: highlight.suffix,
-                activeHighlightID: highlight.id,
-                textStatus: "highlight",
-                readingMode: manifest?.readingMode ?? .preread,
-                furthestPageIndex: manifest?.furthestPageIndex ?? highlight.pageIndex
-            )
-            try writeContext(context)
-            statusMessage = "Active highlight · page \(highlight.pageLabel)"
+            try writeContext(anchorContext(for: highlight))
+            statusMessage = highlight.isRegion
+                ? "Active region · page \(highlight.pageLabel)"
+                : "Active highlight · page \(highlight.pageLabel)"
         } catch {
             errorMessage = "Could not activate the highlight context: \(error.localizedDescription)"
         }
+    }
+
+    /// The agent's context with a highlight or a region as the active
+    /// anchor. A region has no quote: the context names it as a region and
+    /// carries where its pictures are instead.
+    private func anchorContext(for highlight: HighlightRecord) -> CurrentContext {
+        CurrentContext(
+            sessionID: manifest?.id ?? UUID(),
+            sourcePDFPath: manifest?.sourcePDFPath ?? "",
+            sourcePDFFingerprint: manifest?.sourcePDFFingerprint ?? "",
+            pageIndex: highlight.pageIndex,
+            pageLabel: highlight.pageLabel,
+            selectedText: highlight.isRegion ? nil : highlight.quote,
+            prefix: highlight.prefix,
+            suffix: highlight.suffix,
+            activeHighlightID: highlight.id,
+            textStatus: highlight.isRegion ? "region" : "highlight",
+            readingMode: manifest?.readingMode ?? .preread,
+            furthestPageIndex: manifest?.furthestPageIndex ?? highlight.pageIndex,
+            activeRegion: highlight.isRegion ? highlight.region : nil
+        )
     }
 
     func selectComment(_ comment: CommentRecord) {
@@ -921,6 +1050,13 @@ final class AppState: ObservableObject {
 
     private func writeSelectionContext(_ snapshot: SelectionSnapshot?, activeHighlightID: UUID?) throws {
         guard let manifest else { return }
+        // A selected region stays the active anchor while the reader scrolls:
+        // a comment saved now links to it, so the agent is told about it.
+        if snapshot == nil, let activeHighlightID,
+           let region = activeHighlights.first(where: { $0.id == activeHighlightID && $0.isRegion }) {
+            try writeContext(anchorContext(for: region))
+            return
+        }
         let pageIndex = snapshot?.primaryPageIndex ?? currentPageIndex
         let pageLabel = snapshot?.primaryPageLabel ?? currentPageLabel
         let context = CurrentContext(

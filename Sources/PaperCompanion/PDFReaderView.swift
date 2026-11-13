@@ -23,6 +23,15 @@ struct PDFReaderView: NSViewRepresentable {
         pdfView.onAnnotationHoverChange = { [weak coordinator = context.coordinator] id in
             coordinator?.pageHoverChanged(id)
         }
+        pdfView.onRegionDrawn = { [weak state] page, rect in
+            state?.regionDrawn(on: page, rect: rect)
+        }
+        pdfView.onRegionToolCancelled = { [weak state] in
+            state?.regionToolCancelled()
+        }
+        pdfView.onReaderOnScreenChange = { [weak state] onScreen in
+            state?.readerOnScreenChanged(onScreen)
+        }
         pdfView.autoScales = true
         pdfView.displayMode = .singlePageContinuous
         pdfView.displayDirection = .vertical
@@ -42,6 +51,7 @@ struct PDFReaderView: NSViewRepresentable {
             pdfView.document = state.document
             context.coordinator.resetForDocument()
         }
+        (pdfView as? HighlightClickPDFView)?.isRegionToolActive = state.regionToolActive && state.document != nil
         context.coordinator.renderHighlights(
             state.activeHighlights,
             selectedID: state.selectedHighlightID,
@@ -107,6 +117,8 @@ struct PDFReaderView: NSViewRepresentable {
         }
 
         func resetForDocument() {
+            // A box half drawn on the old document has no page to land on.
+            (pdfView as? HighlightClickPDFView)?.cancelRegionDrag()
             renderedHighlightSignature = ""
             renderedAnnotations = [:]
             renderedSelectedID = nil
@@ -131,6 +143,41 @@ struct PDFReaderView: NSViewRepresentable {
             case (true, true): alpha = 0.88
             }
             return (HighlightColor(rawValue: color) ?? .yellow).nsColor.withAlphaComponent(alpha)
+        }
+
+        /// A region's look, in the same steps as `highlightFill`: an outline
+        /// in the region's color over a faint fill, the outline firmer and
+        /// the fill stronger with the pointer on it, stronger again when
+        /// selected, strongest when both. The fill stays light so the figure
+        /// under it reads as it is. Every step has its own outline color, so
+        /// a change of step always redraws the annotation.
+        static func regionStyle(_ color: String, selected: Bool, hovered: Bool) -> RegionAnnotation.Style {
+            // The highlighter hues are made to sit behind black text; a line
+            // in them alone fades on white paper (yellow most), so the
+            // outline takes a darker shade of the same hue.
+            let base = (HighlightColor(rawValue: color) ?? .yellow).nsColor
+            let ink = base.blended(withFraction: 0.3, of: .black) ?? base
+            let stroke: CGFloat, fill: CGFloat, width: CGFloat
+            switch (selected, hovered) {
+            case (false, false): (stroke, fill, width) = (0.85, 0.04, 1.5)
+            case (false, true): (stroke, fill, width) = (0.93, 0.08, 2)
+            case (true, false): (stroke, fill, width) = (0.97, 0.1, 2.5)
+            case (true, true): (stroke, fill, width) = (1, 0.14, 2.5)
+            }
+            return RegionAnnotation.Style(
+                stroke: ink.withAlphaComponent(stroke),
+                fill: base.withAlphaComponent(fill),
+                lineWidth: width
+            )
+        }
+
+        /// Draws a highlight's or a region's annotations in their state.
+        private static func style(_ annotation: PDFAnnotation, color: String, selected: Bool, hovered: Bool) {
+            if let region = annotation as? RegionAnnotation {
+                region.apply(regionStyle(color, selected: selected, hovered: hovered))
+            } else {
+                annotation.color = highlightFill(color, selected: selected, hovered: hovered)
+            }
         }
 
         // MARK: Hover
@@ -172,8 +219,9 @@ struct PDFReaderView: NSViewRepresentable {
             emphasizedID = target
             for id in [previous, target].compactMap({ $0 }) {
                 guard let color = renderedColors[id] else { continue }
-                let fill = Self.highlightFill(color, selected: id == renderedSelectedID, hovered: id == emphasizedID)
-                for annotation in renderedAnnotations[id] ?? [] { annotation.color = fill }
+                for annotation in renderedAnnotations[id] ?? [] {
+                    Self.style(annotation, color: color, selected: id == renderedSelectedID, hovered: id == emphasizedID)
+                }
             }
         }
 
@@ -217,6 +265,18 @@ struct PDFReaderView: NSViewRepresentable {
                     annotation.page?.removeAnnotation(annotation)
                 }
                 var drawn: [PDFAnnotation] = []
+                // A region is one box on one page, drawn as an outline.
+                if highlight.isRegion {
+                    if let rect = highlight.regionRect, let page = document.page(at: highlight.pageIndex) {
+                        let annotation = RegionAnnotation(bounds: rect, forType: .square, withProperties: nil)
+                        Self.style(annotation, color: highlight.color, selected: highlight.id == selectedID, hovered: highlight.id == emphasizedID)
+                        annotation.userName = HighlightClickPDFView.annotationNamePrefix + highlight.id.uuidString
+                        page.addAnnotation(annotation)
+                        drawn.append(annotation)
+                    }
+                    renderedAnnotations[id] = drawn
+                    continue
+                }
                 for location in highlight.locations {
                     guard let page = document.page(at: location.pageIndex) else { continue }
                     for rect in location.lineRects {
@@ -259,7 +319,9 @@ struct PDFReaderView: NSViewRepresentable {
                 pdfView.go(to: page)
                 return
             }
-            let margin = max(destination.height, 24) * 3
+            // A region is usually a whole figure: a little margin, or the
+            // figure itself would be pushed out of view.
+            let margin = highlight.isRegion ? 24 : max(destination.height, 24) * 3
             let padded = destination.insetBy(dx: 0, dy: -margin).intersection(page.bounds(for: pdfView.displayBox))
             pdfView.go(to: padded.isNull ? destination : padded, on: page)
             flash(highlight: highlight, pageIndex: pageIndex, in: pdfView)
@@ -280,6 +342,19 @@ struct PDFReaderView: NSViewRepresentable {
         /// what keeps the highlight visible.
         private func flash(highlight: HighlightRecord, pageIndex: Int, in pdfView: PDFView) {
             guard let page = pdfView.document?.page(at: pageIndex) else { return }
+            if highlight.isRegion {
+                // A filled flash would tint the whole figure; a firm outline
+                // over the region's own catches the eye without hiding it.
+                guard let rect = highlight.regionRect else { return }
+                let overlay = RegionAnnotation(bounds: rect, forType: .square, withProperties: nil)
+                var style = Self.regionStyle(highlight.color, selected: true, hovered: true)
+                style.lineWidth = 4
+                overlay.apply(style)
+                overlay.userName = "PaperCompanionFlash"
+                page.addAnnotation(overlay)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.55) { page.removeAnnotation(overlay) }
+                return
+            }
             let overlays: [PDFAnnotation] = highlight.locations
                 .filter { $0.pageIndex == pageIndex }
                 .flatMap(\.lineRects)
@@ -428,9 +503,67 @@ struct PDFReaderView: NSViewRepresentable {
     }
 }
 
+/// A region drawn on the page: a rounded outline over a faint fill. PDFKit
+/// redraws an annotation when its `color` changes, so `apply` sets that last.
+final class RegionAnnotation: PDFAnnotation {
+    struct Style: Equatable {
+        var stroke: NSColor
+        var fill: NSColor
+        /// Page-space points, so the line grows with the zoom like the box.
+        var lineWidth: CGFloat
+    }
+
+    static let cornerRadius: CGFloat = 4
+
+    func apply(_ style: Style) {
+        let border = PDFBorder()
+        border.lineWidth = style.lineWidth
+        self.border = border
+        interiorColor = style.fill
+        color = style.stroke
+    }
+
+    override func draw(with box: PDFDisplayBox, in context: CGContext) {
+        context.saveGState()
+        page?.transform(context, for: box)
+        Self.draw(in: bounds, stroke: color, fill: interiorColor, lineWidth: border?.lineWidth ?? 1.5, in: context)
+        context.restoreGState()
+    }
+
+    /// The outline sits inside `rect`, so it never covers what is outside
+    /// the box the user drew.
+    static func draw(
+        in rect: CGRect,
+        stroke: NSColor,
+        fill: NSColor?,
+        lineWidth: CGFloat,
+        cornerRadius: CGFloat = cornerRadius,
+        dash: [CGFloat] = [],
+        in context: CGContext
+    ) {
+        let inner = rect.insetBy(dx: lineWidth / 2, dy: lineWidth / 2)
+        guard inner.width > 0, inner.height > 0 else { return }
+        let radius = min(cornerRadius, inner.width / 2, inner.height / 2)
+        let path = CGPath(roundedRect: inner, cornerWidth: radius, cornerHeight: radius, transform: nil)
+        context.saveGState()
+        if let fill {
+            context.addPath(path)
+            context.setFillColor(fill.cgColor)
+            context.fillPath()
+        }
+        context.addPath(path)
+        context.setStrokeColor(stroke.cgColor)
+        context.setLineWidth(lineWidth)
+        if !dash.isEmpty { context.setLineDash(phase: 0, lengths: dash) }
+        context.strokePath()
+        context.restoreGState()
+    }
+}
+
 /// A PDFView that reports single clicks on Paper Companion highlight
 /// annotations. Selection behaviour is untouched: `super` runs first, and the
-/// click only counts when it did not become a drag.
+/// click only counts when it did not become a drag. With the region tool on,
+/// a press draws a box instead and never reaches PDFKit.
 final class HighlightClickPDFView: PDFView {
     var onHighlightClick: ((UUID) -> Void)?
     /// ⌫ or ⌦ while this view has focus. Returns true when it consumed the key.
@@ -462,19 +595,28 @@ final class HighlightClickPDFView: PDFView {
     }
 
     /// The Paper Companion annotation under a point in this view's
-    /// coordinates: the topmost one whose bounds contain it. Clicks, the
-    /// context menu and hover all ask this, so they always agree.
-    func annotationID(at point: NSPoint) -> UUID? {
+    /// coordinates. Where several overlap (a highlight inside a boxed
+    /// figure, a small box over highlighted text) the smallest wins, so each
+    /// stays reachable; among equals, the topmost. Clicks, the context menu
+    /// and hover all ask this, so they always agree.
+    func annotation(at point: NSPoint) -> PDFAnnotation? {
         guard let page = page(for: point, nearest: false) else { return nil }
         let pagePoint = convert(point, to: page)
+        var best: (annotation: PDFAnnotation, area: CGFloat)?
         for annotation in page.annotations.reversed() where annotation.bounds.contains(pagePoint) {
-            if let id = Self.annotationID(of: annotation) { return id }
+            guard Self.annotationID(of: annotation) != nil else { continue }
+            let area = annotation.bounds.width * annotation.bounds.height
+            if best.map({ area < $0.area }) ?? true { best = (annotation, area) }
         }
-        return nil
+        return best?.annotation
     }
 
-    private func annotationID(at event: NSEvent) -> UUID? {
-        annotationID(at: convert(event.locationInWindow, from: nil))
+    func annotationID(at point: NSPoint) -> UUID? {
+        annotation(at: point).flatMap(Self.annotationID(of:))
+    }
+
+    private func annotation(at event: NSEvent) -> PDFAnnotation? {
+        annotation(at: convert(event.locationInWindow, from: nil))
     }
 
     // MARK: Hover
@@ -508,6 +650,51 @@ final class HighlightClickPDFView: PDFView {
         super.viewDidMoveToWindow()
         installHoverTrackingArea()
         observeScrolling()
+        updateEscapeMonitor()
+        observeWindowClosing()
+        // Told on the next turn: this happens inside SwiftUI updates.
+        let onScreen = window != nil
+        let report = onReaderOnScreenChange
+        DispatchQueue.main.async { report?(onScreen) }
+        // The reader left the window (the library took its place): an armed
+        // tool would greet the reader's return with a crosshair nobody asked
+        // for.
+        if window == nil { endRegionToolBecauseTheReaderLeft() }
+    }
+
+    /// The reader is in a window (true) or has left it or its window closed
+    /// (false): `AppState` allows the region tool only while it is shown.
+    var onReaderOnScreenChange: ((Bool) -> Void)?
+    private weak var observedWindow: NSWindow?
+
+    /// A closed window keeps its content view, so `viewDidMoveToWindow` does
+    /// not run when the window closes; its will-close notification does.
+    private func observeWindowClosing() {
+        guard window !== observedWindow else { return }
+        if let observedWindow {
+            NotificationCenter.default.removeObserver(self, name: NSWindow.willCloseNotification, object: observedWindow)
+        }
+        if let window {
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(windowWillClose(_:)),
+                name: NSWindow.willCloseNotification, object: window
+            )
+        }
+        observedWindow = window
+    }
+
+    @objc private func windowWillClose(_ notification: Notification) {
+        endRegionToolBecauseTheReaderLeft()
+        removeEscapeMonitor()
+        onReaderOnScreenChange?(false)
+    }
+
+    private func endRegionToolBecauseTheReaderLeft() {
+        guard isRegionToolActive || regionDrag != nil else { return }
+        cancelRegionDrag()
+        isRegionToolActive = false
+        let cancelled = onRegionToolCancelled
+        DispatchQueue.main.async { cancelled?() }
     }
 
     override func updateTrackingAreas() {
@@ -533,6 +720,8 @@ final class HighlightClickPDFView: PDFView {
     }
 
     @objc private func clipViewScrolled(_ notification: Notification) {
+        // The live box is kept in page space; it moves with the page.
+        regionOverlay?.needsDisplay = true
         guard let location = pointerLocationInWindow else { return }
         pointerMoved(to: location)
     }
@@ -546,7 +735,11 @@ final class HighlightClickPDFView: PDFView {
         pointerLocationInWindow = event.locationInWindow
         updateHover(at: convert(event.locationInWindow, from: nil))
         super.mouseMoved(with: event)
-        if hoveredAnnotationID != nil { setHoverCursor() }
+        if isRegionToolActive {
+            applyCursor()
+        } else if hoveredAnnotationID != nil {
+            setHoverCursor()
+        }
     }
 
     /// The pointer is at `location` (window coordinates) without a
@@ -556,20 +749,24 @@ final class HighlightClickPDFView: PDFView {
         pointerLocationInWindow = location
         let before = hoveredAnnotationID
         updateHover(at: convert(location, from: nil))
-        if hoveredAnnotationID != before { applyCursor() }
+        if hoveredAnnotationID != before || isRegionToolActive { applyCursor() }
     }
 
-    /// The cursor for where the pointer last was: the pointing hand over one
-    /// of our annotations, otherwise what PDFKit chooses for that spot. Only
-    /// while this window has the keyboard (or none has, as when the app is in
-    /// the background, where the system ignores it anyway).
+    /// The cursor for where the pointer last was: the crosshair over a page
+    /// while the region tool is on; otherwise the pointing hand over one of
+    /// our annotations, or what PDFKit chooses for that spot. Only while this
+    /// window has the keyboard (or none has, as when the app is in the
+    /// background, where the system ignores it anyway).
     private func applyCursor() {
         guard let location = pointerLocationInWindow, let window,
               window.isKeyWindow || NSApp.keyWindow == nil else { return }
-        if hoveredAnnotationID != nil {
+        let point = convert(location, from: nil)
+        if isRegionToolActive {
+            regionToolCursor(at: point).set()
+        } else if hoveredAnnotationID != nil {
             setHoverCursor()
         } else {
-            super.setCursorFor(areaOfInterest(for: convert(location, from: nil)))
+            super.setCursorFor(areaOfInterest(for: point))
         }
     }
 
@@ -579,6 +776,7 @@ final class HighlightClickPDFView: PDFView {
         }
         pointerLocationInWindow = event.locationInWindow
         updateHover(at: convert(event.locationInWindow, from: nil))
+        if isRegionToolActive { applyCursor() }
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -587,18 +785,29 @@ final class HighlightClickPDFView: PDFView {
         }
         pointerLocationInWindow = nil
         updateHover(at: nil)
+        // The crosshair is this view's; the sidebar sets no cursor of its
+        // own, so without this it would follow the pointer out.
+        if isRegionToolActive { NSCursor.arrow.set() }
     }
 
     /// PDFView sets the I-beam, arrow or link cursor here as the pointer
     /// moves. Over one of our annotations it is the pointing hand, as for a
     /// link, because a click there selects it. Not while a button is down:
-    /// a drag that started on a highlight is selecting text.
+    /// a drag that started on a highlight is selecting text. With the region
+    /// tool on, the crosshair over a page.
     override func setCursorFor(_ area: PDFAreaOfInterest) {
-        if hoveredAnnotationID != nil, NSEvent.pressedMouseButtons == 0 {
+        if isRegionToolActive {
+            (area.contains(.pageArea) ? NSCursor.crosshair : NSCursor.arrow).set()
+        } else if hoveredAnnotationID != nil, NSEvent.pressedMouseButtons == 0 {
             NSCursor.pointingHand.set()
         } else {
             super.setCursorFor(area)
         }
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        guard isRegionToolActive else { return super.cursorUpdate(with: event) }
+        regionToolCursor(at: convert(event.locationInWindow, from: nil)).set()
     }
 
     private func setHoverCursor() {
@@ -606,9 +815,16 @@ final class HighlightClickPDFView: PDFView {
         NSCursor.pointingHand.set()
     }
 
+    /// What the pointer is on, as hover means it: nothing while the region
+    /// tool is on, because a press there draws a box and selects nothing.
+    private func hoverTarget(at point: NSPoint?) -> UUID? {
+        guard !isRegionToolActive else { return nil }
+        return point.flatMap { annotationID(at: $0) }
+    }
+
     /// Hit-tests on every move but reports only a change.
     private func updateHover(at point: NSPoint?) {
-        let id = point.flatMap { annotationID(at: $0) }
+        let id = hoverTarget(at: point)
         guard id != hoveredAnnotationID else { return }
         hoveredAnnotationID = id
         onAnnotationHoverChange?(id)
@@ -621,17 +837,170 @@ final class HighlightClickPDFView: PDFView {
     /// over a highlight that was deleted.
     @discardableResult
     func refreshHover() -> UUID? {
-        let id = pointerLocationInWindow.flatMap { annotationID(at: convert($0, from: nil)) }
+        let id = hoverTarget(at: pointerLocationInWindow.map { convert($0, from: nil) })
         guard id != hoveredAnnotationID else { return id }
         hoveredAnnotationID = id
         applyCursor()
         return id
     }
 
+    // MARK: Region tool
+
+    /// Mirrors `AppState.regionToolActive`. While on, a press on a page
+    /// draws a box; the tool turns itself off when the press ends.
+    var isRegionToolActive = false {
+        didSet {
+            guard isRegionToolActive != oldValue else { return }
+            if !isRegionToolActive { cancelRegionDrag() }
+            updateEscapeMonitor()
+            // Hover and cursor change meaning with the tool, under a pointer
+            // that has not moved. The cursor is set even when the hover did
+            // not change: over plain text both are nil before and after, and
+            // the crosshair would otherwise stay.
+            if let location = pointerLocationInWindow {
+                pointerMoved(to: location)
+                applyCursor()
+            }
+        }
+    }
+
+    /// A box drawn with the tool: its page, and the rectangle in page space
+    /// (standardized and inside the crop box; possibly too small to keep).
+    /// The tool is already off when this is called.
+    var onRegionDrawn: ((PDFPage, CGRect) -> Void)?
+    /// The tool turned off without a box: Esc, or the reader left the window.
+    var onRegionToolCancelled: (() -> Void)?
+
+    struct RegionDrag {
+        let page: PDFPage
+        let start: CGPoint
+        var end: CGPoint
+
+        /// Page space.
+        var rect: CGRect {
+            CGRect(x: min(start.x, end.x), y: min(start.y, end.y),
+                   width: abs(end.x - start.x), height: abs(end.y - start.y))
+        }
+    }
+
+    /// The box being drawn, if any.
+    private(set) var regionDrag: RegionDrag?
+    /// A press that began with the tool on, until its release. The rest of
+    /// that press never reaches PDFKit, even after Esc ended the tool midway,
+    /// or PDFKit would select text from a press it never saw begin.
+    private var regionPressInProgress = false
+    private var regionOverlay: RegionDragOverlay?
+    private var escapeMonitor: Any?
+
+    private func regionToolCursor(at point: NSPoint) -> NSCursor {
+        page(for: point, nearest: false) == nil ? .arrow : .crosshair
+    }
+
+    private func beginRegionDrag(with event: NSEvent) {
+        regionPressInProgress = true
+        let point = convert(event.locationInWindow, from: nil)
+        // A press beside the pages draws nothing; the tool stays on.
+        guard let page = page(for: point, nearest: false) else { return }
+        window?.makeFirstResponder(self)
+        // The new region becomes the anchor; a text selection left on screen
+        // would claim to be one too.
+        if !(currentSelection?.string?.isEmpty ?? true) { clearSelection() }
+        let start = Self.clamp(convert(point, to: page), to: page)
+        regionDrag = RegionDrag(page: page, start: start, end: start)
+        let overlay = regionOverlay ?? RegionDragOverlay(pdfView: self)
+        regionOverlay = overlay
+        overlay.frame = bounds
+        overlay.autoresizingMask = [.width, .height]
+        if overlay.superview !== self { addSubview(overlay, positioned: .above, relativeTo: nil) }
+        overlay.needsDisplay = true
+    }
+
+    private func updateRegionDrag(with event: NSEvent) {
+        guard var drag = regionDrag else { return }
+        // Past the edge of the view, scroll so a figure taller than the view
+        // can still be boxed whole.
+        documentView?.autoscroll(with: event)
+        drag.end = Self.clamp(convert(convert(event.locationInWindow, from: nil), to: drag.page), to: drag.page)
+        regionDrag = drag
+        regionOverlay?.needsDisplay = true
+    }
+
+    private func finishRegionDrag(with event: NSEvent) {
+        updateRegionDrag(with: event)
+        guard let drag = regionDrag else { return }
+        removeRegionOverlay()
+        regionDrag = nil
+        // One box per use: the tool is off before the region exists, so the
+        // cursor and hover are back to normal over the new region.
+        isRegionToolActive = false
+        onRegionDrawn?(drag.page, drag.rect)
+    }
+
+    /// Drops a box in progress without saving it. The tool's state is the
+    /// caller's to change.
+    func cancelRegionDrag() {
+        regionDrag = nil
+        removeRegionOverlay()
+    }
+
+    /// Esc while the tool is on: off, and nothing else.
+    func cancelRegionTool() {
+        guard isRegionToolActive else { return }
+        isRegionToolActive = false
+        onRegionToolCancelled?()
+    }
+
+    private func removeRegionOverlay() {
+        regionOverlay?.removeFromSuperview()
+    }
+
+    private static func clamp(_ point: CGPoint, to page: PDFPage) -> CGPoint {
+        let crop = page.bounds(for: .cropBox)
+        return CGPoint(x: min(max(point.x, crop.minX), crop.maxX), y: min(max(point.y, crop.minY), crop.maxY))
+    }
+
+    /// Esc turns the tool off wherever the keyboard is in this window (the
+    /// comment box included), and goes no further: it neither collapses a
+    /// card nor reaches a text field. A monitor, because the keyboard is
+    /// often not in this view when the tool is armed from the toolbar.
+    private func updateEscapeMonitor() {
+        if isRegionToolActive, window != nil {
+            guard escapeMonitor == nil else { return }
+            escapeMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                MainActor.assumeIsolated {
+                    guard let self, self.isRegionToolActive,
+                          Self.isPlainEscape(event), event.window === self.window else { return event }
+                    self.cancelRegionDrag()
+                    self.cancelRegionTool()
+                    return nil
+                }
+            }
+        } else {
+            removeEscapeMonitor()
+        }
+    }
+
+    private func removeEscapeMonitor() {
+        guard let escapeMonitor else { return }
+        NSEvent.removeMonitor(escapeMonitor)
+        self.escapeMonitor = nil
+    }
+
+    /// Whether the tool's Esc monitor is installed; for tests.
+    var hasEscapeMonitor: Bool { escapeMonitor != nil }
+
+    static func isPlainEscape(_ event: NSEvent) -> Bool {
+        event.keyCode == 53 && event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
+    }
+
     // MARK: Clicks
 
     override func mouseDown(with event: NSEvent) {
-        let id = annotationID(at: event)
+        if isRegionToolActive {
+            beginRegionDrag(with: event)
+            return
+        }
+        let id = annotation(at: event).flatMap(Self.annotationID(of:))
         super.mouseDown(with: event)
         // PDFKit tracks a drag inside `super` and takes its dragged and up
         // events, so no mouse-moved follows a selection drag: the pointer may
@@ -641,6 +1010,11 @@ final class HighlightClickPDFView: PDFView {
               currentSelection?.string?.isEmpty ?? true else { return }
         window?.makeFirstResponder(self)
         onHighlightClick?(id)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        if regionPressInProgress { return updateRegionDrag(with: event) }
+        super.mouseDragged(with: event)
     }
 
     /// Where the pointer is once PDFKit's tracking of a press has returned:
@@ -655,17 +1029,30 @@ final class HighlightClickPDFView: PDFView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if regionPressInProgress {
+            regionPressInProgress = false
+            // Where the release is, before the tool turns off and sets the
+            // cursor for the spot under the pointer.
+            pointerLocationInWindow = event.locationInWindow
+            finishRegionDrag(with: event)
+            pointerMoved(to: event.locationInWindow)
+            applyCursor()
+            return
+        }
         super.mouseUp(with: event)
         pointerMoved(to: event.locationInWindow)
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
-        guard let id = annotationID(at: event) else { return super.menu(for: event) }
+        guard let annotation = annotation(at: event), let id = Self.annotationID(of: annotation) else {
+            return super.menu(for: event)
+        }
+        let isRegion = annotation is RegionAnnotation
         clearSelection()
         window?.makeFirstResponder(self)
         onHighlightClick?(id)
         menuHighlightID = id
-        let menu = NSMenu(title: "Highlight")
+        let menu = NSMenu(title: isRegion ? "Region" : "Highlight")
         for color in HighlightColor.allCases {
             let item = NSMenuItem(title: color.rawValue.capitalized, action: #selector(changeHighlightColor(_:)), keyEquivalent: "")
             item.target = self
@@ -681,7 +1068,11 @@ final class HighlightClickPDFView: PDFView {
             menu.addItem(item)
         }
         menu.addItem(.separator())
-        let delete = NSMenuItem(title: "Delete Highlight and Comments", action: #selector(deleteMenuHighlight(_:)), keyEquivalent: "")
+        let delete = NSMenuItem(
+            title: isRegion ? "Delete Region and Comments" : "Delete Highlight and Comments",
+            action: #selector(deleteMenuHighlight(_:)),
+            keyEquivalent: ""
+        )
         delete.target = self
         menu.addItem(delete)
         return menu
@@ -695,5 +1086,43 @@ final class HighlightClickPDFView: PDFView {
     @objc private func deleteMenuHighlight(_ sender: NSMenuItem) {
         guard let id = menuHighlightID else { return }
         onHighlightDelete?(id)
+    }
+}
+
+/// The box while it is being dragged, drawn above the pages in the look the
+/// region will have once saved (selected), with a dashed line until the
+/// button comes up. It takes no clicks.
+final class RegionDragOverlay: NSView {
+    private weak var pdfView: HighlightClickPDFView?
+
+    init(pdfView: HighlightClickPDFView) {
+        self.pdfView = pdfView
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not used") }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    /// The live box in this view's coordinates, nil when none is drawn.
+    var boxInView: NSRect? {
+        guard let pdfView, let drag = pdfView.regionDrag else { return nil }
+        return convert(pdfView.convert(drag.rect, from: drag.page), from: pdfView)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard let pdfView, let box = boxInView, let context = NSGraphicsContext.current?.cgContext else { return }
+        let scale = pdfView.scaleFactor
+        let style = PDFReaderView.Coordinator.regionStyle(AppState.newRegionColor.rawValue, selected: true, hovered: false)
+        RegionAnnotation.draw(
+            in: box,
+            stroke: style.stroke,
+            fill: style.fill,
+            lineWidth: style.lineWidth * scale,
+            cornerRadius: RegionAnnotation.cornerRadius * scale,
+            dash: [5 * scale, 3 * scale],
+            in: context
+        )
     }
 }

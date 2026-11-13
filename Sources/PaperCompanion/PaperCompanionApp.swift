@@ -66,7 +66,15 @@ struct PaperCompanionApp: App {
                     .disabled(state.document == nil)
 
                 Divider()
-                Button("Remove Selected Highlight", action: state.deleteSelectedHighlight)
+                // A toggle, so the menu shows a check while the tool waits
+                // for its box.
+                Toggle("Comment on Region", isOn: $state.regionToolActive)
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .disabled(!state.canUseRegionTool)
+
+                Divider()
+                Button(state.selectedHighlight?.isRegion == true ? "Remove Selected Region" : "Remove Selected Highlight",
+                       action: state.deleteSelectedHighlight)
                     .disabled(state.selectedHighlight == nil)
             }
 

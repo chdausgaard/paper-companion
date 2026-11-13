@@ -68,6 +68,14 @@ Sessions` and are never touched by an update.
 6. Keep document-level, unanchored Markdown notes in the Notes tab. The detachable Notes window carries the composer and document notes so the sidebar can stay on the list.
 7. Choose a **reading mode** in the Agent tab (or the Agent menu) and copy the agent prompt into your existing agent client.
 
+### Comments on figures and tables
+
+To comment on something that is not text — a figure, a table, an equation set as an image — press **⇧⌘R** (Highlights → Comment on Region, or the dashed-box button in the toolbar) and drag a box over it. The box stays on the page as an outline, the cursor moves to the comment box, and the comment you type is linked to the box. The tool is used once per box; **Esc** cancels it. A box needs no comment to stay, like a highlight. Click a box to select it; **⌫** removes it and its comments, **⌘Z** brings them back, and right-click changes its color. Boxes cannot be moved or resized: delete one and draw it again.
+
+In the list, a box shows a small picture of what it holds, a larger one when expanded, and the nearest figure or table caption when it has no comment.
+
+The agent gets what it needs to tell which figure you mean. When the box is drawn the app writes `regions/<id>.png`, the boxed area at high resolution, and `regions/<id>-page.png`, the whole page with the box outlined in red. The record in `state/highlights.json` has `kind: "region"` and holds the text the PDF carries inside the box (axis labels, tick values, panel titles) and a caption guess, the nearest line that starts like "Figure 3" or "Table 2". `comments.md` gives each box its own section with the picture, the caption guess, that text and your comments, and `bridge/current-context.*` names the box while it is selected. `AGENTS.md` tells the agent to look at both pictures, to treat the text inside the box as the paper's own words, and to check the caption guess before relying on it.
+
 ### Reading modes
 
 - **Agent pre-reads** (default): the agent reads the whole paper first and fills `agent/shared-understanding.md` before you comment, so comments are interpreted against the real design.

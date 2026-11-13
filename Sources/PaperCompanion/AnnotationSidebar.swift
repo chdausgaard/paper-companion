@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import PaperCompanionCore
 import SwiftUI
 
@@ -95,7 +96,9 @@ struct AnnotationList: View {
             }
         }
         .background(
-            EscapeKeyMonitor(isEnabled: state.selectedEntryID != nil) {
+            // While the region tool is on, Esc belongs to it: it turns the
+            // tool off and does nothing else (`HighlightClickPDFView`).
+            EscapeKeyMonitor(isEnabled: state.selectedEntryID != nil && !state.regionToolActive) {
                 state.clearEntrySelection()
             }
         )
@@ -125,7 +128,7 @@ struct AnnotationList: View {
             Text("No comments match “\(query.trimmingCharacters(in: .whitespacesAndNewlines))”")
                 .font(.headline)
                 .multilineTextAlignment(.center)
-            Text("Search looks at your comments, and at the text of highlights that have no comment.")
+            Text("Search looks at your comments, and at what a card without one shows: the highlighted text, or a region’s caption.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -137,12 +140,15 @@ struct AnnotationList: View {
     }
 
     private func summary(_ entries: [AnnotationEntry]) -> String {
-        let highlights = entries.filter { $0.highlight != nil }.count
+        let regions = entries.filter { $0.highlight?.isRegion == true }.count
+        let highlights = entries.filter { $0.highlight != nil }.count - regions
         let comments = entries.reduce(0) { $0 + $1.comments.count }
         let replies = state.agentReplies.keys.filter { id in
             entries.contains { $0.comments.contains { $0.id == id } }
         }.count
-        var parts = ["\(highlights) highlight\(highlights == 1 ? "" : "s")", "\(comments) comment\(comments == 1 ? "" : "s")"]
+        var parts = ["\(highlights) highlight\(highlights == 1 ? "" : "s")"]
+        if regions > 0 { parts.append("\(regions) region\(regions == 1 ? "" : "s")") }
+        parts.append("\(comments) comment\(comments == 1 ? "" : "s")")
         if replies > 0 { parts.append("\(replies) repl\(replies == 1 ? "y" : "ies")") }
         return parts.joined(separator: " · ")
     }
@@ -174,18 +180,18 @@ struct PageGroupHeader: View {
 
 // MARK: - Anchor markers
 
-/// What a card is attached to, shown as a small leading marker. Stage 3 adds
-/// a region case drawn as an image thumbnail; the marker column leaves room for
-/// it.
+/// What a card is attached to, shown as a small leading marker.
 enum AnchorMarker: Equatable {
     /// A comment on highlighted text, or a highlight with no comment yet.
     case highlight(HighlightColor)
     /// A page-level comment (also a comment whose highlight was removed).
     case page
+    /// A box drawn on the page: a thumbnail of what it holds.
+    case region(HighlightRecord)
 
     init(entry: AnnotationEntry) {
         if let highlight = entry.highlight {
-            self = .highlight(HighlightColor(rawValue: highlight.color) ?? .yellow)
+            self = highlight.isRegion ? .region(highlight) : .highlight(HighlightColor(rawValue: highlight.color) ?? .yellow)
         } else {
             self = .page
         }
@@ -195,6 +201,7 @@ enum AnchorMarker: Equatable {
         switch self {
         case .highlight: return "Attached to highlighted text"
         case .page: return "Attached to the page"
+        case .region: return "Attached to a boxed area of the page"
         }
     }
 }
@@ -203,10 +210,15 @@ struct AnchorMarkerView: View {
     let marker: AnchorMarker
     /// Width of the leading marker column on cards.
     static let columnWidth: CGFloat = 14
+    /// A region's thumbnail is wider than the column: a picture smaller than
+    /// this does not show which figure it is.
+    static let regionThumbnailSize = CGSize(width: 34, height: 26)
 
     var body: some View {
         Group {
             switch marker {
+            case .region(let highlight):
+                RegionThumbnail(highlight: highlight, size: Self.regionThumbnailSize)
             case .highlight(let color):
                 RoundedRectangle(cornerRadius: 3, style: .continuous)
                     .fill(Color(nsColor: color.nsColor))
@@ -221,9 +233,216 @@ struct AnchorMarkerView: View {
                     .foregroundStyle(.secondary)
             }
         }
-        .frame(width: Self.columnWidth, height: 14)
+        .frame(width: frameSize.width, height: frameSize.height)
         .help(marker.helpText)
         .accessibilityLabel(marker.helpText)
+    }
+
+    private var frameSize: CGSize {
+        if case .region = marker { return Self.regionThumbnailSize }
+        return CGSize(width: Self.columnWidth, height: 14)
+    }
+}
+
+// MARK: - Region pictures
+
+/// Region pictures for the sidebar. The files are found, read and scaled
+/// down to the size shown off the main thread (ImageIO makes the small
+/// picture straight from the file without decoding it whole), then kept: a
+/// bounded cache of results, and a list of pictures found missing so a
+/// missing file is not looked for again. The files are written once when a
+/// region is drawn and never change, so nothing kept goes stale.
+@MainActor
+enum RegionImageCache {
+    enum Entry {
+        case image(NSImage)
+        /// No picture file (a folder removed or emptied by hand).
+        case missing
+    }
+
+    private static let images: NSCache<NSString, NSImage> = {
+        let cache = NSCache<NSString, NSImage>()
+        cache.countLimit = 400
+        // Pixels × 4 bytes; a few hundred thumbnails and a dozen previews.
+        cache.totalCostLimit = 64 * 1024 * 1024
+        return cache
+    }()
+    private static var missing: Set<String> = []
+    /// Loads under way. They hand back nothing: the result goes into the
+    /// cache, where every caller waiting on the load reads it.
+    private static var loads: [String: Task<Void, Never>] = [:]
+    /// Loads finished, and whether any is under way: for tests that wait
+    /// for the pictures.
+    private(set) static var finishedLoads = 0
+    static var isLoading: Bool { !loads.isEmpty }
+
+    static func key(for highlight: HighlightRecord, paths: SessionPaths?, maxPixels: Int) -> String {
+        "\(paths?.root.path ?? "-")|\(highlight.id.uuidString)|\(maxPixels)"
+    }
+
+    /// What is known without touching the disk; nil when not loaded yet.
+    static func cached(for highlight: HighlightRecord, paths: SessionPaths?, maxPixels: Int) -> Entry? {
+        guard highlight.isRegion, paths != nil else { return .missing }
+        let key = key(for: highlight, paths: paths, maxPixels: maxPixels)
+        if let image = images.object(forKey: key as NSString) { return .image(image) }
+        return missing.contains(key) ? .missing : nil
+    }
+
+    /// Loads the picture once; callers asking for the same one meanwhile
+    /// share the load.
+    static func load(for highlight: HighlightRecord, paths: SessionPaths?, maxPixels: Int) async -> Entry {
+        if let known = cached(for: highlight, paths: paths, maxPixels: maxPixels) { return known }
+        guard let paths else { return .missing }
+        let key = key(for: highlight, paths: paths, maxPixels: maxPixels)
+        let task: Task<Void, Never>
+        if let running = loads[key] {
+            task = running
+        } else {
+            task = Task { @MainActor in
+                let picture = await Task.detached(priority: .utility) {
+                    decode(highlight, paths: paths, maxPixels: maxPixels)
+                }.value
+                loads[key] = nil
+                finishedLoads += 1
+                guard let picture else {
+                    missing.insert(key)
+                    return
+                }
+                let image = NSImage(cgImage: picture.image, size: NSSize(width: picture.image.width, height: picture.image.height))
+                images.setObject(image, forKey: key as NSString, cost: picture.image.width * picture.image.height * 4)
+            }
+            loads[key] = task
+        }
+        await task.value
+        return cached(for: highlight, paths: paths, maxPixels: maxPixels) ?? .missing
+    }
+
+    /// A decoded picture handed from the loading thread to the main one.
+    /// A `CGImage` is immutable, so sharing it across threads is safe.
+    struct Picture: @unchecked Sendable {
+        let image: CGImage
+    }
+
+    /// Off the main thread: the file checks and ImageIO's downsampling.
+    nonisolated private static func decode(_ highlight: HighlightRecord, paths: SessionPaths, maxPixels: Int) -> Picture? {
+        guard let url = paths.regionImage(of: highlight),
+              let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceShouldCacheImmediately: true,
+                  kCGImageSourceThumbnailMaxPixelSize: maxPixels,
+              ] as CFDictionary) else { return nil }
+        return Picture(image: image)
+    }
+}
+
+/// Shows a region's picture once it is loaded: `content` gets the entry,
+/// or nil while it loads.
+struct RegionImageLoader<Content: View>: View {
+    @EnvironmentObject private var state: AppState
+    let highlight: HighlightRecord
+    let maxPixels: Int
+    @ViewBuilder let content: (RegionImageCache.Entry?) -> Content
+    /// The result of this view's own load, with the key it was for: the
+    /// composer's chip shows one region and then another.
+    @State private var loaded: (key: String, entry: RegionImageCache.Entry)?
+
+    var body: some View {
+        let paths = state.sessionPaths
+        let key = RegionImageCache.key(for: highlight, paths: paths, maxPixels: maxPixels)
+        let entry = loaded.flatMap { $0.key == key ? $0.entry : nil }
+            ?? RegionImageCache.cached(for: highlight, paths: paths, maxPixels: maxPixels)
+        content(entry)
+            .task(id: key) {
+                guard RegionImageCache.cached(for: highlight, paths: paths, maxPixels: maxPixels) == nil else { return }
+                let result = await RegionImageCache.load(for: highlight, paths: paths, maxPixels: maxPixels)
+                loaded = (key, result)
+            }
+    }
+}
+
+/// A region's picture filling a small frame, as a card's marker and in the
+/// composer's chip. Edged in the region's own color, like its box on the
+/// page. A quiet empty frame while it loads; a dashed box when the picture
+/// is missing.
+struct RegionThumbnail: View {
+    @Environment(\.displayScale) private var displayScale
+    let highlight: HighlightRecord
+    let size: CGSize
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 3, style: .continuous)
+        let maxPixels = Int((max(size.width, size.height) * max(displayScale, 1)).rounded(.up))
+        RegionImageLoader(highlight: highlight, maxPixels: maxPixels) { entry in
+            ZStack {
+                switch entry {
+                case .image(let image):
+                    // The paper is white in both appearances; so is its picture.
+                    Color.white
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: size.width, height: size.height)
+                case .missing:
+                    Image(systemName: "rectangle.dashed")
+                        .font(.system(size: min(size.height * 0.6, 14)))
+                        .foregroundStyle(.secondary)
+                case nil:
+                    Color.primary.opacity(0.05)
+                }
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(Color(nsColor: RegionInk.outline(highlight.color)), lineWidth: 1))
+    }
+}
+
+/// The larger picture on an expanded region card: the whole crop, fitted.
+struct RegionPreview: View {
+    @Environment(\.displayScale) private var displayScale
+    let highlight: HighlightRecord
+    /// Enough to tell the figure apart while the comment under it stays in
+    /// view in a short list.
+    static let maxHeight: CGFloat = 160
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 6, style: .continuous)
+        RegionImageLoader(highlight: highlight, maxPixels: Int((560 * max(displayScale, 1)).rounded(.up))) { entry in
+            switch entry {
+            case .image(let image):
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .background(Color.white)
+                    .clipShape(shape)
+                    // Edged in the region's color, like its thumbnail and its
+                    // box on the page.
+                    .overlay(shape.strokeBorder(Color(nsColor: RegionInk.outline(highlight.color)), lineWidth: 1))
+                    .frame(maxWidth: .infinity, maxHeight: Self.maxHeight, alignment: .leading)
+                    .accessibilityLabel("Picture of the boxed area on page \(highlight.pageLabel)")
+            case .missing:
+                Label("The picture of this region is missing from the session folder", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            case nil:
+                shape
+                    .fill(Color.primary.opacity(0.05))
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 90)
+            }
+        }
+    }
+}
+
+/// A region's outline color, the same shade as its box on the page.
+@MainActor
+enum RegionInk {
+    static func outline(_ color: String) -> NSColor {
+        PDFReaderView.Coordinator.regionStyle(color, selected: true, hovered: false).stroke
     }
 }
 
@@ -269,13 +488,30 @@ struct AnnotationCard: View {
 
     private var showsControls: Bool { expanded || pointer != .idle }
 
+    /// The card's region, when it is attached to one.
+    private var region: HighlightRecord? {
+        entry.highlight.flatMap { $0.isRegion ? $0 : nil }
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
-            AnchorMarkerView(marker: AnchorMarker(entry: entry))
-                .padding(.top, entry.comments.isEmpty ? 1 : 2)
+            // An expanded region shows its picture large across the card; the
+            // thumbnail beside it would only repeat it.
+            if region == nil || !expanded {
+                AnchorMarkerView(marker: AnchorMarker(entry: entry))
+                    .padding(.top, region != nil ? 0 : entry.comments.isEmpty ? 1 : 2)
+            }
             VStack(alignment: .leading, spacing: 8) {
+                if let region, expanded {
+                    RegionPreview(highlight: region)
+                        .transition(.opacity)
+                }
                 if entry.comments.isEmpty, let highlight = entry.highlight {
-                    quoteRow(highlight)
+                    if highlight.isRegion {
+                        regionRow(highlight)
+                    } else {
+                        quoteRow(highlight)
+                    }
                 }
                 ForEach(entry.comments) { comment in
                     commentBlock(comment)
@@ -314,7 +550,9 @@ struct AnnotationCard: View {
             including: editingCommentID != nil ? .subviews : .all
         )
         .contextMenu { contextMenuItems }
-        .help(expanded ? "" : "Click to show the full text and go to the passage")
+        .help(expanded ? "" : region != nil
+            ? "Click to show the picture and go to the region"
+            : "Click to show the full text and go to the passage")
         .accessibilityAddTraits(expanded ? [.isSelected] : [.isButton])
         .padding(.horizontal, 8)
     }
@@ -339,7 +577,19 @@ struct AnnotationCard: View {
 
     @ViewBuilder
     private var contextMenuItems: some View {
-        if let highlight = entry.highlight {
+        if let highlight = entry.highlight, highlight.isRegion {
+            Button("Go to Region") { state.selectHighlight(highlight) }
+            // A region has no quote; the text the PDF carries inside the box
+            // (labels, tick values) is what there is to copy, when there is any.
+            if let text = highlight.region?.textInRegion, !text.isEmpty {
+                Button("Copy Text in Region") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                }
+            }
+            Divider()
+            Button("Remove Region", role: .destructive) { state.deleteHighlight(highlight.id) }
+        } else if let highlight = entry.highlight {
             Button("Go to Highlight") { state.selectHighlight(highlight) }
             Button("Copy Highlighted Text") {
                 NSPasteboard.general.clearContents()
@@ -371,6 +621,34 @@ struct AnnotationCard: View {
                     Image(systemName: "trash")
                 }
                 .help("Remove this highlight (⌘Z to undo)")
+            }
+        }
+    }
+
+    /// A region with no comment: its caption guess, which is what tells one
+    /// figure from another at a glance, or a plain note that it has none.
+    private func regionRow(_ highlight: HighlightRecord) -> some View {
+        HStack(alignment: .top, spacing: 4) {
+            Group {
+                if let caption = highlight.region?.captionGuess, !caption.isEmpty {
+                    Text(emphasized(caption))
+                        .help("The nearest caption on the page: a guess")
+                } else {
+                    Text("Region · no comment")
+                }
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .lineLimit(expanded ? nil : 2)
+            .modifier(SelectableWhen(enabled: expanded))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            controls {
+                Button(role: .destructive) {
+                    state.deleteHighlight(highlight.id)
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .help("Remove this region (⌘Z to undo)")
             }
         }
     }
@@ -704,9 +982,18 @@ struct CommentComposer: View {
     }
 
     private var placeholder: String {
-        if state.selectedHighlight != nil { return "Comment on this highlight · ⌘↩ saves" }
+        if let highlight = state.selectedHighlight {
+            return highlight.isRegion ? "Comment on this region · ⌘↩ saves" : "Comment on this highlight · ⌘↩ saves"
+        }
         if state.currentSelection != nil { return "Comment on the selection · ⌘↩ saves" }
         return "Comment on page \(state.currentPageLabel) · ⌘↩ saves"
+    }
+
+    private var saveHelp: String {
+        if state.selectedHighlight?.isRegion == true { return "Save linked to the selected region (⌘↩)" }
+        return state.hasCommentAnchor
+            ? "Save linked to the highlighted text; a selection becomes a new highlight (⌘↩)"
+            : "Save anchored to page \(state.currentPageLabel) (⌘↩)"
     }
 
     var body: some View {
@@ -714,10 +1001,10 @@ struct CommentComposer: View {
             HStack(spacing: 6) {
                 ComposerAnchorChip()
                 Spacer(minLength: 0)
-                if state.selectedHighlight != nil {
+                if let highlight = state.selectedHighlight {
                     Button("Detach", action: state.clearEntrySelection)
                         .controlSize(.small)
-                        .help("Stop linking to the selected highlight; the next comment goes to the page")
+                        .help("Stop linking to the selected \(highlight.isRegion ? "region" : "highlight"); the next comment goes to the page")
                 }
             }
 
@@ -776,9 +1063,7 @@ struct CommentComposer: View {
                     state.saveCommentFromKeyboard()
                 }
                 .buttonStyle(.borderedProminent)
-                .help(state.hasCommentAnchor
-                    ? "Save linked to the highlighted text; a selection becomes a new highlight (⌘↩)"
-                    : "Save anchored to page \(state.currentPageLabel) (⌘↩)")
+                .help(saveHelp)
             }
         }
         .padding(12)
@@ -813,7 +1098,18 @@ struct ComposerAnchorChip: View {
         .accessibilityLabel(anchor.help)
     }
 
+    static let regionThumbnailSize = CGSize(width: 22, height: 16)
+
     private func describe() -> (icon: AnyView, page: String, detail: String?, help: String) {
+        if let highlight = state.selectedHighlight, highlight.isRegion {
+            let caption = highlight.region?.captionGuess.flatMap { $0.isEmpty ? nil : $0 }
+            return (
+                AnyView(RegionThumbnail(highlight: highlight, size: Self.regionThumbnailSize)),
+                "Linked to region · p. \(highlight.pageLabel)",
+                caption,
+                "Linked to region · p. \(highlight.pageLabel)" + (caption.map { " · \($0)" } ?? "")
+            )
+        }
         if let highlight = state.selectedHighlight {
             let quote = "“\(highlight.quote.normalizedForSearch)”"
             return (

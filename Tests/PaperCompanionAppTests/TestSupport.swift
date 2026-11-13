@@ -6,6 +6,7 @@ import PDFKit
 import SwiftUI
 import XCTest
 @testable import PaperCompanion
+import PaperCompanionCore
 
 /// Event and offscreen-window helpers shared by the interaction and snapshot
 /// tests. Everything stays in-process: events go through `NSWindow.sendEvent`
@@ -196,6 +197,102 @@ enum TestPDF {
     }
 }
 
+/// A page with a figure on it, for region tests: a title and a paragraph,
+/// a bar chart whose year labels are real text, its caption below, a note
+/// beside it, and a line of plain text under it. Page 2 is plain text.
+/// All coordinates are page space (y up) on a 500 × 420 page.
+enum FigurePDF {
+    static let size = NSSize(width: 500, height: 420)
+    /// The chart with its axis labels: what a reader would box.
+    static let figure = CGRect(x: 50, y: 128, width: 290, height: 162)
+    static let bars = [0.35, 0.5, 0.62, 0.8, 0.7]
+    static let years = ["2009", "2011", "2013", "2015", "2017"]
+    static let caption = "Figure 2: Turnout by year of rollout"
+
+    @MainActor
+    static func make() -> Data {
+        let data = NSMutableData()
+        var box = CGRect(origin: .zero, size: size)
+        guard let consumer = CGDataConsumer(data: data as CFMutableData),
+              let context = CGContext(consumer: consumer, mediaBox: &box, nil) else { return Data() }
+        func text(_ string: String, _ rect: CGRect, size: CGFloat = 11, bold: Bool = false) {
+            NSAttributedString(string: string, attributes: [
+                .font: bold ? NSFont.boldSystemFont(ofSize: size) : NSFont.systemFont(ofSize: size),
+                .foregroundColor: NSColor.black,
+            ]).draw(in: rect)
+        }
+
+        context.beginPDFPage(nil)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        text("Effects of early rollout on turnout", CGRect(x: 40, y: 375, width: 420, height: 20), size: 14, bold: true)
+        text("Treated municipalities saw turnout rise relative to the synthetic control, and the gap opened in the first election after the reform.",
+             CGRect(x: 40, y: 315, width: 420, height: 50))
+        // The chart: axes, five bars, the years under them.
+        let plot = CGRect(x: 70, y: 150, width: 260, height: 130)
+        context.setStrokeColor(CGColor(gray: 0.2, alpha: 1))
+        context.setLineWidth(1)
+        context.move(to: CGPoint(x: plot.minX, y: plot.maxY))
+        context.addLine(to: CGPoint(x: plot.minX, y: plot.minY))
+        context.addLine(to: CGPoint(x: plot.maxX, y: plot.minY))
+        context.strokePath()
+        for (index, value) in bars.enumerated() {
+            let x = plot.minX + 16 + CGFloat(index) * 50
+            context.setFillColor(CGColor(srgbRed: 0.25, green: 0.42, blue: 0.7, alpha: 1))
+            context.fill(CGRect(x: x, y: plot.minY, width: 28, height: plot.height * value))
+            text(years[index], CGRect(x: x - 2, y: plot.minY - 18, width: 40, height: 14), size: 9)
+        }
+        text(caption, CGRect(x: 50, y: 100, width: 300, height: 16))
+        text("Treated places rose fastest in the first two years.", CGRect(x: 360, y: 200, width: 110, height: 70))
+        text("Plain words under the figure for the selection test.", CGRect(x: 40, y: 50, width: 420, height: 16))
+        NSGraphicsContext.restoreGraphicsState()
+        context.endPDFPage()
+
+        context.beginPDFPage(nil)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: false)
+        text("The design exploits the staggered rollout across regions between 2009 and 2015.", CGRect(x: 40, y: 340, width: 420, height: 40))
+        NSGraphicsContext.restoreGraphicsState()
+        context.endPDFPage()
+        context.closePDF()
+        return data as Data
+    }
+}
+
+/// A real reading session in a temporary folder, with the figure PDF open,
+/// so regions can write their pictures and records as in the app. The
+/// session folder is removed by `remove()`.
+@MainActor
+final class RegionTestSession {
+    let folder: URL
+    let state: AppState
+    let document: PDFDocument
+
+    init() throws {
+        folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PaperCompanionRegionTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let pdfURL = folder.appendingPathComponent("figure-paper.pdf")
+        try FigurePDF.make().write(to: pdfURL)
+        let session = try SessionRepository().createOrLoadSession(
+            pdfURL: pdfURL, title: "Figure paper", pageCount: 2, extractedText: "",
+            sessionsRoot: folder.appendingPathComponent("Sessions", isDirectory: true)
+        )
+        document = try XCTUnwrap(PDFDocument(url: pdfURL))
+        state = AppState()
+        state.autoHighlightEnabled = false
+        state.manifest = session.manifest
+        state.sessionPaths = session.paths
+        state.document = document
+    }
+
+    var paths: SessionPaths { state.sessionPaths! }
+
+    func remove() {
+        try? FileManager.default.removeItem(at: folder)
+    }
+}
+
 /// The PDF reader and the inspector side by side, as in the app window, in
 /// an offscreen window that can receive events.
 @MainActor
@@ -371,6 +468,18 @@ enum SnapshotOutput {
             }
             context.restoreGState()
         }
+        // Views the PDF view hosts above its pages (the box being dragged
+        // with the region tool) are drawn by AppKit, under the page layers
+        // painted above; paint them again on top, from their own drawing.
+        for overlay in pdfView.subviews where overlay is RegionDragOverlay && !overlay.isHidden {
+            guard let overlayRep = overlay.bitmapImageRepForCachingDisplay(in: overlay.bounds) else { continue }
+            appearance.performAsCurrentDrawingAppearance { overlay.cacheDisplay(in: overlay.bounds, to: overlayRep) }
+            guard let image = overlayRep.cgImage else { continue }
+            context.saveGState()
+            context.clip(to: device(host.convert(clip.bounds, from: clip)))
+            context.draw(image, in: device(host.convert(overlay.bounds, from: overlay)))
+            context.restoreGState()
+        }
         return rep
     }
 
@@ -389,7 +498,12 @@ enum SnapshotOutput {
         guard !layer.isHidden, layer.opacity > 0 else { return }
         context.saveGState()
         defer { context.restoreGState() }
-        context.translateBy(x: layer.frame.minX - layer.bounds.minX, y: layer.frame.minY - layer.bounds.minY)
+        // The layer's own geometry, transform included: PDFKit turns the
+        // annotation layers of a rotated page with it.
+        context.translateBy(x: layer.position.x, y: layer.position.y)
+        context.concatenate(layer.affineTransform())
+        context.translateBy(x: -layer.anchorPoint.x * layer.bounds.width - layer.bounds.minX,
+                            y: -layer.anchorPoint.y * layer.bounds.height - layer.bounds.minY)
         context.setAlpha(CGFloat(layer.opacity))
         let multiply = multiply || String(describing: layer.compositingFilter ?? "").contains("multiply")
         context.setBlendMode(multiply ? .multiply : .normal)
@@ -419,6 +533,10 @@ enum SnapshotOutput {
                 image = images.createCGImage(ci, from: ci.extent)
             } else if CFGetTypeID(contents as CFTypeRef) == CGImage.typeID {
                 image = (contents as! CGImage)
+            } else {
+                // A layer PDFKit drew itself (a square annotation): its
+                // backing store is private, so Core Animation renders it.
+                layer.render(in: context)
             }
             if let image {
                 let size = CGSize(width: CGFloat(image.width) / layer.contentsScale, height: CGFloat(image.height) / layer.contentsScale)
