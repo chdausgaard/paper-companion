@@ -55,7 +55,7 @@ final class AppUpdates: ObservableObject {
             • Search your comments with ⇧⌘F.
             • Making a highlight puts the cursor in the comment box. Esc returns to the paper.
             • Highlights, list entries, Library rows and tabs answer the pointer.
-            • Papers that hold a box open only in version 0.5.0 or later.
+            • A reading session that holds a box opens only in version 0.5.0 or later. The PDF itself is never changed.
             """ : "This version of Paper Companion has been installed. Open the release notes for the full list of changes.",
             releaseURL: Self.releasesURL
         )
